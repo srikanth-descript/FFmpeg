@@ -1781,6 +1781,15 @@ static int configure_input_video_filter(FilterGraph *fg, AVFilterGraph *graph,
         ifp->displaymatrix_applied = 1;
     }
 
+    if (ifp->opts.force_cfr.num > 0 && ifp->opts.force_cfr.den > 0) {
+        char force_cfr_buf[64];
+        snprintf(force_cfr_buf, sizeof(force_cfr_buf), "%d/%d",
+                 ifp->opts.force_cfr.num, ifp->opts.force_cfr.den);
+        ret = insert_filter(&last_filter, &pad_idx, "fps", force_cfr_buf);
+        if (ret < 0)
+            return ret;
+    }
+
     snprintf(name, sizeof(name), "trim_in_%s", ifp->opts.name);
     ret = insert_trim(ifp->opts.trim_start_us, ifp->opts.trim_end_us,
                       &last_filter, &pad_idx, name);

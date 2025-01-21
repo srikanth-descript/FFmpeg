@@ -176,6 +176,7 @@ typedef struct OptionsContext {
     SpecifierOptList hwaccel_output_formats;
     SpecifierOptList autorotate;
     SpecifierOptList apply_cropping;
+    SpecifierOptList force_cfr;
 
     /* output options */
     StreamMap *stream_maps;
@@ -275,6 +276,9 @@ typedef struct InputFilterOptions {
      * Otherwise, this is an estimate that should not be relied upon to be
      * accurate */
     AVRational          framerate;
+
+    /* convert input stream to CFR at this framerate before inserting additional filters */
+    AVRational                force_cfr;
 
     unsigned            crop_top;
     unsigned            crop_bottom;
@@ -451,6 +455,9 @@ typedef struct InputStream {
 
     /* framerate forced with -r */
     AVRational            framerate;
+
+    /* convert input stream to CFR at this framerate before inserting additional filters */
+    AVRational                force_cfr;
 #if FFMPEG_OPT_TOP
     int                   top_field_first;
 #endif

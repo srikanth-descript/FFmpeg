@@ -2033,5 +2033,9 @@ const OptionDef options[] = {
         "set video sync method globally; deprecated, use -fps_mode", "" },
 #endif
 
+    { "force_cfr", OPT_TYPE_STRING, OPT_VIDEO | OPT_EXPERT | OPT_PERSTREAM | OPT_INPUT,
+        { .off = OFFSET(force_cfr) },
+        "set frame rate (Hz value, fraction or abbreviation)", "force_cfr" },
+
     { NULL, },
 };
