@@ -5,20 +5,24 @@
 
 static int efp_write_header(AVFormatContext *s)
 {
+    EFPContext *efp = s->priv_data;
+
     // Write format header
     avio_write(s->pb, "EFP\0", 4);    
     // Add your format-specific header writing here
+    avio_write(s->pb, efp, sizeof(EFPContext));
     
     return 0;
 }
 
 static int efp_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
+
+    EFPContext *efp = s->priv_data;
     // Write packet data
     // Implement your packet writing logic here
     // avio_write(s->pb, pkt->data, pkt->size);
-
-    av_log(s, AV_LOG_WARNING, "Writing packet %d\n", s->pb);
+    av_log(s, AV_LOG_WARNING, "Writing packet %d\n", efp->mtu_bytes);
 
     return 0;
 }

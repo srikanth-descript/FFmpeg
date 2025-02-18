@@ -14,12 +14,19 @@
 #define EFP_MAGIC_SIZE 4
 
 typedef struct EFPContext {
-    int64_t data_start;     /* Offset where data starts */
-    int64_t packet_count;   /* Number of packets */
-    int stream_index;       /* Current stream being processed */
+    int64_t context_id;     /* Context ID */
+    int64_t mtu_bytes;      /* MTU bytes */
 } EFPContext;
 
+typedef struct EFPConnection {
+    int64_t hol_blocking_time;
+    int32_t mtu_bytes;
+} EFPStream;
+
+
 static const AVOption efp_options[] = {
+    { "context_id", "Context ID", offsetof(EFPContext, context_id), AV_OPT_TYPE_INT64, {.i64 = 0}, 0, INT64_MAX, AV_OPT_FLAG_ENCODING_PARAM },
+    { "mtu_bytes", "MTU bytes", offsetof(EFPContext, mtu_bytes), AV_OPT_TYPE_INT64, {.i64 = 1500}, 0, INT32_MAX, AV_OPT_FLAG_ENCODING_PARAM },
     { NULL }
 };
 
