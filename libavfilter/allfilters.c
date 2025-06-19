@@ -354,6 +354,7 @@ extern const FFFilter ff_vf_lut;
 extern const FFFilter ff_vf_lut1d;
 extern const FFFilter ff_vf_lut2;
 extern const FFFilter ff_vf_lut3d;
+extern const FFFilter ff_vf_lut3d_cuda;
 extern const FFFilter ff_vf_lutrgb;
 extern const FFFilter ff_vf_lutyuv;
 extern const FFFilter ff_vf_maskedclamp;

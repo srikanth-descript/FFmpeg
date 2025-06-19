@@ -379,6 +379,8 @@ OBJS-$(CONFIG_LUT1D_FILTER)                  += vf_lut3d.o
 OBJS-$(CONFIG_LUT_FILTER)                    += vf_lut.o
 OBJS-$(CONFIG_LUT2_FILTER)                   += vf_lut2.o framesync.o
 OBJS-$(CONFIG_LUT3D_FILTER)                  += vf_lut3d.o framesync.o
+OBJS-$(CONFIG_LUT3D_CUDA_FILTER)             += vf_lut3d_cuda.o \
+                                                vf_lut3d_cuda.ptx.o cuda/load_helper.o
 OBJS-$(CONFIG_LUTRGB_FILTER)                 += vf_lut.o
 OBJS-$(CONFIG_LUTYUV_FILTER)                 += vf_lut.o
 OBJS-$(CONFIG_MASKEDCLAMP_FILTER)            += vf_maskedclamp.o framesync.o
