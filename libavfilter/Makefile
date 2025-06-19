@@ -532,6 +532,8 @@ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o
 OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
 OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
 OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o
+OBJS-$(CONFIG_TONEMAP_CUDA_FILTER)           += vf_tonemap_cuda.o \
+                                                vf_tonemap_cuda.ptx.o cuda/load_helper.o
 OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o \
                                                 opencl/tonemap.o opencl/colorspace_common.o
 OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o
