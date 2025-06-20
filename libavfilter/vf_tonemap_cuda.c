@@ -38,7 +38,6 @@
 
 #include "cuda/load_helper.h"
 #include "vf_tonemap_cuda.h"
-#include "cuda_async_queue.h"
 
 static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_GBRPF32,
@@ -86,11 +85,6 @@ typedef struct TonemapCudaContext {
     CUfunction  cu_func;
     CUstream    cu_stream;
 
-    // Async processing queue
-    CudaAsyncQueue async_queue;
-    int async_depth;
-    int async_streams;
-    int async_enabled;
 
     enum TonemapAlgorithm tonemap;
     double param;
@@ -123,13 +117,6 @@ static av_cold int tonemap_cuda_init(AVFilterContext *ctx)
     if (!s->tmp_frame)
         return AVERROR(ENOMEM);
 
-    // Set async processing defaults
-    if (s->async_depth <= 0)
-        s->async_depth = DEFAULT_FRAME_QUEUE_SIZE;
-    if (s->async_streams <= 0)
-        s->async_streams = DEFAULT_CUDA_STREAMS;
-    
-    s->async_enabled = (s->async_depth > 1 || s->async_streams > 1);
 
     switch(s->tonemap) {
     case TONEMAP_GAMMA:
@@ -156,9 +143,6 @@ static av_cold void tonemap_cuda_uninit(AVFilterContext *ctx)
 {
     TonemapCudaContext *s = ctx->priv;
 
-    // Uninitialize async queue first
-    if (s->async_enabled)
-        cuda_async_queue_uninit(&s->async_queue);
 
     if (s->hwctx && s->cu_module) {
         CudaFunctions *cu = s->hwctx->internal->cuda_dl;
@@ -353,7 +337,7 @@ static av_cold int tonemap_cuda_config_props(AVFilterLink *outlink)
     return 0;
 }
 
-static int call_tonemap_kernel_async(AVFilterContext *ctx, AVFrame *out, AVFrame *in, CUstream stream)
+static int call_tonemap_kernel(AVFilterContext *ctx, AVFrame *out, AVFrame *in)
 {
     TonemapCudaContext *s = ctx->priv;
     CudaFunctions *cu = s->hwctx->internal->cuda_dl;
@@ -380,7 +364,7 @@ static int call_tonemap_kernel_async(AVFilterContext *ctx, AVFrame *out, AVFrame
 
         ret = CHECK_CU(cu->cuLaunchKernel(s->cu_func,
                                            DIV_UP(out->width, BLOCKX), DIV_UP(out->height, BLOCKY), 1,
-                                           BLOCKX, BLOCKY, 1, 0, stream, args, NULL));
+                                           BLOCKX, BLOCKY, 1, 0, s->cu_stream, args, NULL));
     } else if ((s->in_fmt == AV_PIX_FMT_P010LE || s->in_fmt == AV_PIX_FMT_P016LE) && s->out_fmt == AV_PIX_FMT_NV12) {
         // P016 to NV12 conversion
         CUDA_TEXTURE_DESC tex_desc_y = {
@@ -434,7 +418,7 @@ static int call_tonemap_kernel_async(AVFilterContext *ctx, AVFrame *out, AVFrame
 
         ret = CHECK_CU(cu->cuLaunchKernel(s->cu_func,
                                            DIV_UP(out->width, BLOCKX), DIV_UP(out->height, BLOCKY), 1,
-                                           BLOCKX, BLOCKY, 1, 0, stream, args, NULL));
+                                           BLOCKX, BLOCKY, 1, 0, s->cu_stream, args, NULL));
         
         if (tex_y) CHECK_CU(cu->cuTexObjectDestroy(tex_y));
         if (tex_uv) CHECK_CU(cu->cuTexObjectDestroy(tex_uv));
@@ -491,7 +475,7 @@ static int call_tonemap_kernel_async(AVFilterContext *ctx, AVFrame *out, AVFrame
 
         ret = CHECK_CU(cu->cuLaunchKernel(s->cu_func,
                                            DIV_UP(out->width, BLOCKX), DIV_UP(out->height, BLOCKY), 1,
-                                           BLOCKX, BLOCKY, 1, 0, stream, args, NULL));
+                                           BLOCKX, BLOCKY, 1, 0, s->cu_stream, args, NULL));
         
         if (tex_y) CHECK_CU(cu->cuTexObjectDestroy(tex_y));
         if (tex_uv) CHECK_CU(cu->cuTexObjectDestroy(tex_uv));
@@ -532,7 +516,7 @@ static int call_tonemap_kernel_async(AVFilterContext *ctx, AVFrame *out, AVFrame
 
         ret = CHECK_CU(cu->cuLaunchKernel(s->cu_func,
                                            DIV_UP(out->width, BLOCKX), DIV_UP(out->height, BLOCKY), 1,
-                                           BLOCKX, BLOCKY, 1, 0, stream, args, NULL));
+                                           BLOCKX, BLOCKY, 1, 0, s->cu_stream, args, NULL));
     }
 
 exit:
@@ -544,104 +528,6 @@ exit:
     return ret;
 }
 
-static int call_tonemap_kernel(AVFilterContext *ctx, AVFrame *out, AVFrame *in)
-{
-    TonemapCudaContext *s = ctx->priv;
-    return call_tonemap_kernel_async(ctx, out, in, s->cu_stream);
-}
-
-static int tonemap_cuda_filter_frame_async(AVFilterContext *ctx, AVFrame *in)
-{
-    TonemapCudaContext *s = ctx->priv;
-    AVFilterLink *outlink = ctx->outputs[0];
-    CudaAsyncFrame *async_frame;
-    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
-    CUcontext dummy;
-    int ret;
-
-    // Try to get a completed frame first
-    async_frame = cuda_async_queue_get_completed_frame(&s->async_queue);
-    if (async_frame) {
-        AVFrame *completed_out = async_frame->output_frame;
-        async_frame->output_frame = NULL;
-        
-        ret = ff_filter_frame(outlink, completed_out);
-        if (ret < 0)
-            return ret;
-    }
-
-    // Get a free frame for processing
-    async_frame = cuda_async_queue_get_free_frame(&s->async_queue);
-    if (!async_frame) {
-        // Queue is full, wait for any frame to complete
-        cuda_async_queue_sync_all(&s->async_queue);
-        
-        // Try to get a completed frame and output it
-        async_frame = cuda_async_queue_get_completed_frame(&s->async_queue);
-        if (async_frame) {
-            AVFrame *completed_out = async_frame->output_frame;
-            async_frame->output_frame = NULL;
-            
-            ret = ff_filter_frame(outlink, completed_out);
-            if (ret < 0)
-                return ret;
-        }
-        
-        // Now get a free frame for new processing
-        async_frame = cuda_async_queue_get_free_frame(&s->async_queue);
-        if (!async_frame)
-            return AVERROR(EAGAIN);
-    }
-
-    // Setup input frame
-    av_frame_move_ref(async_frame->frame, in);
-    
-    // Use pre-allocated output frame buffer
-    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
-    if (ret < 0)
-        return ret;
-        
-    ret = av_hwframe_get_buffer(s->frames_ctx, async_frame->output_frame, 0);
-    if (ret < 0) {
-        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-        return ret;
-    }
-    
-    // Submit frame to queue BEFORE processing
-    ret = cuda_async_queue_submit_frame(&s->async_queue, async_frame);
-    if (ret < 0) {
-        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-        return ret;
-    }
-    
-    // Launch kernel on the assigned stream
-    CUstream stream = s->async_queue.streams[async_frame->stream_idx];
-    ret = call_tonemap_kernel_async(ctx, async_frame->output_frame, async_frame->frame, stream);
-    if (ret < 0) {
-        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-        return ret;
-    }
-    
-    // Record completion event
-    ret = CHECK_CU(cu->cuEventRecord(async_frame->event_done, stream));
-    if (ret < 0) {
-        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-        return ret;
-    }
-    
-    // Copy frame properties
-    ret = av_frame_copy_props(async_frame->output_frame, async_frame->frame);
-    if (ret < 0) {
-        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-        return ret;
-    }
-    
-    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-    if (ret < 0)
-        return ret;
-        
-    return 0;
-}
 
 static int tonemap_cuda_filter_frame(AVFilterLink *link, AVFrame *in)
 {
@@ -657,11 +543,6 @@ static int tonemap_cuda_filter_frame(AVFilterLink *link, AVFrame *in)
     if (s->passthrough)
         return ff_filter_frame(outlink, in);
 
-    // Use async processing if enabled
-    if (s->async_enabled)
-        return tonemap_cuda_filter_frame_async(ctx, in);
-
-    // Original synchronous processing
     out = av_frame_alloc();
     if (!out) {
         ret = AVERROR(ENOMEM);
@@ -710,8 +591,6 @@ static const AVOption tonemap_cuda_options[] = {
     { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl=2}, 0, DBL_MAX, FLAGS },
     { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl=0}, 0, DBL_MAX, FLAGS },
     { "passthrough",  "Do not process frames at all if parameters match", OFFSET(passthrough), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
-    { "async_depth",  "Async frame queue depth for pipeline parallelism", OFFSET(async_depth), AV_OPT_TYPE_INT, {.i64=DEFAULT_FRAME_QUEUE_SIZE}, 1, MAX_FRAME_QUEUE_SIZE, FLAGS },
-    { "async_streams", "Number of CUDA streams for concurrent processing", OFFSET(async_streams), AV_OPT_TYPE_INT, {.i64=DEFAULT_CUDA_STREAMS}, 1, MAX_CUDA_STREAMS, FLAGS },
     { NULL },
 };
 
