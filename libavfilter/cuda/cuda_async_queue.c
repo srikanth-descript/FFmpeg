@@ -98,10 +98,15 @@ void ff_cuda_async_queue_uninit(CudaAsyncQueue *queue)
     }
     
     for (int i = 0; i < queue->queue_size; i++) {
-        if (queue->frames[i].event_start)
+        // Synchronize events before destroying to prevent memory leaks
+        if (queue->frames[i].event_start) {
+            cu->cuEventSynchronize(queue->frames[i].event_start);
             cu->cuEventDestroy(queue->frames[i].event_start);
-        if (queue->frames[i].event_done)
+        }
+        if (queue->frames[i].event_done) {
+            cu->cuEventSynchronize(queue->frames[i].event_done);
             cu->cuEventDestroy(queue->frames[i].event_done);
+        }
         
         av_frame_free(&queue->frames[i].input_frame);
         av_frame_free(&queue->frames[i].output_frame);
@@ -245,6 +250,18 @@ int ff_cuda_async_queue_flush(CudaAsyncQueue *queue)
         ret = ff_cuda_async_queue_receive(queue, &frame);
         if (ret == 0 && frame) {
             av_frame_free(&frame);
+        } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
+            // Force cleanup of remaining frames
+            for (int i = 0; i < queue->queue_size; i++) {
+                if (queue->frames[i].in_use) {
+                    av_frame_free(&queue->frames[i].input_frame);
+                    av_frame_free(&queue->frames[i].output_frame);
+                    queue->frames[i].in_use = 0;
+                }
+            }
+            queue->frames_in_queue = 0;
+            queue->read_idx = queue->write_idx = 0;
+            break;
         }
     }
     

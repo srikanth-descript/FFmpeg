@@ -561,6 +561,9 @@ static int cudacolorspace_activate(AVFilterContext *ctx)
                     ret = ff_filter_frame(outlink, out);
                     if (ret < 0)
                         return ret;
+                } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                    av_log(ctx, AV_LOG_WARNING, "Error receiving async frame during flush: %d\n", ret);
+                    break;
                 }
             }
         }
