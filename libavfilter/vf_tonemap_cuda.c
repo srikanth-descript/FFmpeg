@@ -38,6 +38,7 @@
 
 #include "cuda/load_helper.h"
 #include "vf_tonemap_cuda.h"
+#include "cuda/cuda_async_queue.h"
 
 static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_GBRPF32,
@@ -93,6 +94,10 @@ typedef struct TonemapCudaContext {
 
     const AVLumaCoefficients *coeffs;
     int passthrough;
+    
+    int async_depth;
+    int async_streams;
+    CudaAsyncQueue async_queue;
 } TonemapCudaContext;
 
 static int format_is_supported(enum AVPixelFormat fmt)
@@ -139,6 +144,8 @@ static av_cold int tonemap_cuda_init(AVFilterContext *ctx)
     return 0;
 }
 
+static int process_frame_async(void *filter_ctx, AVFrame *out, AVFrame *in, CUstream stream);
+
 static av_cold void tonemap_cuda_uninit(AVFilterContext *ctx)
 {
     TonemapCudaContext *s = ctx->priv;
@@ -157,6 +164,10 @@ static av_cold void tonemap_cuda_uninit(AVFilterContext *ctx)
     av_frame_free(&s->frame);
     av_buffer_unref(&s->frames_ctx);
     av_frame_free(&s->tmp_frame);
+    
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        ff_cuda_async_queue_uninit(&s->async_queue);
+    }
 }
 
 static av_cold int init_hwframe_ctx(TonemapCudaContext *s, AVBufferRef *device_ctx, int width, int height)
@@ -333,6 +344,19 @@ static av_cold int tonemap_cuda_config_props(AVFilterLink *outlink)
     ret = tonemap_cuda_load_functions(ctx);
     if (ret < 0)
         return ret;
+
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        av_log(ctx, AV_LOG_DEBUG, "Async processing enabled: depth=%d streams=%d\n", 
+               s->async_depth, s->async_streams);
+        
+        ret = ff_cuda_async_queue_init(&s->async_queue, s->hwctx, 
+                                       s->async_depth, s->async_streams,
+                                       ctx, process_frame_async);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to initialize async queue\n");
+            return ret;
+        }
+    }
 
     return 0;
 }
@@ -529,6 +553,74 @@ exit:
 }
 
 
+static int tonemap_cuda_filter_frame(AVFilterLink *link, AVFrame *in);
+
+static int process_frame_async(void *filter_ctx, AVFrame *out, AVFrame *in, CUstream stream)
+{
+    AVFilterContext *ctx = (AVFilterContext *)filter_ctx;
+    TonemapCudaContext *s = ctx->priv;
+    CUstream old_stream = s->cu_stream;
+    int ret;
+    
+    s->cu_stream = stream;
+    ret = call_tonemap_kernel(ctx, out, in);
+    s->cu_stream = old_stream;
+    
+    return ret;
+}
+
+static int tonemap_cuda_activate(AVFilterContext *ctx)
+{
+    AVFilterLink *inlink = ctx->inputs[0];
+    AVFilterLink *outlink = ctx->outputs[0];
+    TonemapCudaContext *s = ctx->priv;
+    AVFrame *in = NULL;
+    int ret, status;
+    int64_t pts;
+
+    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        AVFrame *out = NULL;
+        ret = ff_cuda_async_queue_receive(&s->async_queue, &out);
+        if (ret == 0 && out) {
+            return ff_filter_frame(outlink, out);
+        } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
+            return ret;
+        }
+    }
+
+    ret = ff_inlink_consume_frame(inlink, &in);
+    if (ret < 0)
+        return ret;
+    
+    if (in) {
+        ret = tonemap_cuda_filter_frame(inlink, in);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
+        if (s->async_depth > 1 || s->async_streams > 1) {
+            while (!ff_cuda_async_queue_is_empty(&s->async_queue)) {
+                AVFrame *out = NULL;
+                ret = ff_cuda_async_queue_receive(&s->async_queue, &out);
+                if (ret == 0 && out) {
+                    ret = ff_filter_frame(outlink, out);
+                    if (ret < 0)
+                        return ret;
+                }
+            }
+        }
+        ff_outlink_set_status(outlink, status, pts);
+        return 0;
+    }
+
+    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+
+    return FFERROR_NOT_READY;
+}
+
 static int tonemap_cuda_filter_frame(AVFilterLink *link, AVFrame *in)
 {
     AVFilterContext       *ctx = link->dst;
@@ -542,6 +634,47 @@ static int tonemap_cuda_filter_frame(AVFilterLink *link, AVFrame *in)
 
     if (s->passthrough)
         return ff_filter_frame(outlink, in);
+
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        ret = ff_cuda_async_queue_submit(&s->async_queue, in);
+        if (ret == AVERROR(EAGAIN)) {
+            AVFrame *completed_frame = NULL;
+            ret = ff_cuda_async_queue_receive(&s->async_queue, &completed_frame);
+            if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                av_frame_free(&in);
+                return ret;
+            }
+            if (completed_frame) {
+                ret = ff_filter_frame(outlink, completed_frame);
+                if (ret < 0) {
+                    av_frame_free(&in);
+                    return ret;
+                }
+            }
+            ret = ff_cuda_async_queue_submit(&s->async_queue, in);
+        }
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
+        
+        while (ff_inlink_queued_frames(link) == 0) {
+            AVFrame *completed_frame = NULL;
+            ret = ff_cuda_async_queue_receive(&s->async_queue, &completed_frame);
+            if (ret == AVERROR(EAGAIN)) {
+                break;
+            } else if (ret < 0) {
+                return ret;
+            }
+            if (completed_frame) {
+                ret = ff_filter_frame(outlink, completed_frame);
+                if (ret < 0)
+                    return ret;
+            }
+        }
+        
+        return 0;
+    }
 
     out = av_frame_alloc();
     if (!out) {
@@ -591,6 +724,8 @@ static const AVOption tonemap_cuda_options[] = {
     { "desat",        "desaturation strength", OFFSET(desat), AV_OPT_TYPE_DOUBLE, {.dbl=2}, 0, DBL_MAX, FLAGS },
     { "peak",         "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl=0}, 0, DBL_MAX, FLAGS },
     { "passthrough",  "Do not process frames at all if parameters match", OFFSET(passthrough), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+    { "async_depth",  "Frame queue depth for async processing", OFFSET(async_depth), AV_OPT_TYPE_INT, {.i64=1}, 1, MAX_FRAME_QUEUE_SIZE, FLAGS },
+    { "async_streams", "Number of CUDA streams for async processing", OFFSET(async_streams), AV_OPT_TYPE_INT, {.i64=1}, 1, MAX_CUDA_STREAMS, FLAGS },
     { NULL },
 };
 
@@ -605,7 +740,6 @@ static const AVFilterPad tonemap_cuda_inputs[] = {
     {
         .name        = "default",
         .type        = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = tonemap_cuda_filter_frame,
     },
 };
 
@@ -625,6 +759,7 @@ const FFFilter ff_vf_tonemap_cuda = {
 
     .init          = tonemap_cuda_init,
     .uninit        = tonemap_cuda_uninit,
+    .activate      = tonemap_cuda_activate,
 
     .priv_size = sizeof(TonemapCudaContext),
 
