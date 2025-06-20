@@ -559,12 +559,30 @@ static int process_frame_async(void *filter_ctx, AVFrame *out, AVFrame *in, CUst
 {
     AVFilterContext *ctx = (AVFilterContext *)filter_ctx;
     TonemapCudaContext *s = ctx->priv;
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
     CUstream old_stream = s->cu_stream;
+    CUcontext dummy;
     int ret;
     
+    // Allocate output frame buffer (context will be managed by call_tonemap_kernel)
+    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+    if (ret < 0)
+        return ret;
+    
+    ret = av_hwframe_get_buffer(s->frames_ctx, out, 0);
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    
+    if (ret < 0)
+        return ret;
+    
+    // Set the stream and call the kernel (kernel manages its own context)
     s->cu_stream = stream;
     ret = call_tonemap_kernel(ctx, out, in);
     s->cu_stream = old_stream;
+    
+    if (ret >= 0) {
+        ret = av_frame_copy_props(out, in);
+    }
     
     return ret;
 }

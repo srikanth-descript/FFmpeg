@@ -577,12 +577,30 @@ static int process_frame_async(void *filter_ctx, AVFrame *out, AVFrame *in, CUst
 {
     AVFilterContext *ctx = (AVFilterContext *)filter_ctx;
     CUDAColorspaceContext *s = ctx->priv;
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
     CUstream old_stream = s->cu_stream;
+    CUcontext dummy;
     int ret;
     
+    // Allocate output frame buffer (context will be managed by cudacolorspace_conv)
+    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+    if (ret < 0)
+        return ret;
+    
+    ret = av_hwframe_get_buffer(s->frames_ctx, out, 0);
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    
+    if (ret < 0)
+        return ret;
+    
+    // Set the stream and call the conv function (conv manages its own context)
     s->cu_stream = stream;
     ret = cudacolorspace_conv(ctx, out, in);
     s->cu_stream = old_stream;
+    
+    if (ret >= 0) {
+        ret = av_frame_copy_props(out, in);
+    }
     
     return ret;
 }
