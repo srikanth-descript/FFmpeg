@@ -35,6 +35,7 @@
 #include "colorspace.h"
 
 #include "cuda/load_helper.h"
+#include "cuda_async_queue.h"
 
 static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_NV12,
@@ -61,6 +62,12 @@ typedef struct CUDAColorspaceContext {
     CUmodule cu_module;
     CUfunction cu_convert[AVCOL_RANGE_NB];
     CUfunction cu_convert_colorspace;
+
+    // Async processing queue
+    CudaAsyncQueue async_queue;
+    int async_depth;
+    int async_streams;
+    int async_enabled;
 
     enum AVPixelFormat pix_fmt;
     enum AVColorRange range;
@@ -122,12 +129,24 @@ static av_cold int cudacolorspace_init(AVFilterContext* ctx)
     if (!s->tmp_frame)
         return AVERROR(ENOMEM);
 
+    // Set async processing defaults
+    if (s->async_depth <= 0)
+        s->async_depth = DEFAULT_FRAME_QUEUE_SIZE;
+    if (s->async_streams <= 0)
+        s->async_streams = DEFAULT_CUDA_STREAMS;
+    
+    s->async_enabled = (s->async_depth > 1 || s->async_streams > 1);
+
     return 0;
 }
 
 static av_cold void cudacolorspace_uninit(AVFilterContext* ctx)
 {
     CUDAColorspaceContext* s = ctx->priv;
+
+    // Uninitialize async queue first
+    if (s->async_enabled)
+        cuda_async_queue_uninit(&s->async_queue);
 
     if (s->hwctx && s->cu_module) {
         CudaFunctions* cu = s->hwctx->internal->cuda_dl;
@@ -484,6 +503,94 @@ static int cudacolorspace_conv(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
     return 0;
 }
 
+static int cudacolorspace_filter_frame_async(AVFilterContext* ctx, AVFrame* in)
+{
+    CUDAColorspaceContext* s = ctx->priv;
+    AVFilterLink* outlink = ctx->outputs[0];
+    AVFilterLink* inlink = ctx->inputs[0];
+    CudaAsyncFrame* async_frame;
+    CudaFunctions* cu = s->hwctx->internal->cuda_dl;
+    CUcontext dummy;
+    int ret;
+
+    // Try to get a completed frame first
+    async_frame = cuda_async_queue_get_completed_frame(&s->async_queue);
+    if (async_frame) {
+        AVFrame* completed_out = async_frame->output_frame;
+        async_frame->output_frame = NULL;
+        
+        av_reduce(&completed_out->sample_aspect_ratio.num, &completed_out->sample_aspect_ratio.den,
+                  (int64_t)async_frame->frame->sample_aspect_ratio.num * outlink->h * inlink->w,
+                  (int64_t)async_frame->frame->sample_aspect_ratio.den * outlink->w * inlink->h,
+                  INT_MAX);
+        
+        ret = ff_filter_frame(outlink, completed_out);
+        if (ret < 0)
+            return ret;
+    }
+
+    // Get a free frame for processing
+    async_frame = cuda_async_queue_get_free_frame(&s->async_queue);
+    if (!async_frame) {
+        // Queue is full, wait for the oldest frame to complete
+        async_frame = &s->async_queue.frames[s->async_queue.head];
+        ret = cuda_async_queue_wait_for_completion(&s->async_queue, async_frame);
+        if (ret < 0)
+            return ret;
+        
+        // Output the completed frame
+        AVFrame* completed_out = async_frame->output_frame;
+        async_frame->output_frame = NULL;
+        async_frame->in_use = 0;
+        s->async_queue.count--;
+        s->async_queue.head = (s->async_queue.head + 1) % s->async_queue.queue_size;
+        
+        av_reduce(&completed_out->sample_aspect_ratio.num, &completed_out->sample_aspect_ratio.den,
+                  (int64_t)async_frame->frame->sample_aspect_ratio.num * outlink->h * inlink->w,
+                  (int64_t)async_frame->frame->sample_aspect_ratio.den * outlink->w * inlink->h,
+                  INT_MAX);
+        
+        ret = ff_filter_frame(outlink, completed_out);
+        if (ret < 0)
+            return ret;
+    }
+
+    // Setup input frame
+    av_frame_move_ref(async_frame->frame, in);
+    
+    // Allocate output frame buffer
+    async_frame->output_frame = av_frame_alloc();
+    if (!async_frame->output_frame)
+        return AVERROR(ENOMEM);
+    
+    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+    if (ret < 0)
+        return ret;
+        
+    ret = cudacolorspace_conv(ctx, async_frame->output_frame, async_frame->frame);
+    if (ret < 0) {
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+        return ret;
+    }
+    
+    // Record completion event on the assigned stream
+    CUstream stream = s->async_queue.streams[async_frame->stream_idx];
+    ret = CHECK_CU(cu->cuEventRecord(async_frame->event_done, stream));
+    if (ret < 0) {
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+        return ret;
+    }
+    
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    
+    // Submit frame to queue
+    ret = cuda_async_queue_submit_frame(&s->async_queue, async_frame);
+    if (ret < 0)
+        return ret;
+        
+    return 0;
+}
+
 static int cudacolorspace_filter_frame(AVFilterLink* link, AVFrame* in)
 {
     AVFilterContext* ctx = link->dst;
@@ -495,6 +602,11 @@ static int cudacolorspace_filter_frame(AVFilterLink* link, AVFrame* in)
     CUcontext dummy;
     int ret = 0;
 
+    // Use async processing if enabled
+    if (s->async_enabled)
+        return cudacolorspace_filter_frame_async(ctx, in);
+
+    // Original synchronous processing
     out = av_frame_alloc();
     if (!out) {
         ret = AVERROR(ENOMEM);
@@ -551,6 +663,9 @@ static const AVOption options[] = {
         {"bt709",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_TRC_BT709 },      0, 0, FLAGS, .unit = "trc"},
         {"bt2020-10",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_TRC_BT2020_10 },  0, 0, FLAGS, .unit = "trc"},
         {"smpte170m",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_TRC_SMPTE170M },  0, 0, FLAGS, .unit = "trc"},
+    
+    { "async_depth",  "Async frame queue depth for pipeline parallelism", OFFSET(async_depth), AV_OPT_TYPE_INT, {.i64=DEFAULT_FRAME_QUEUE_SIZE}, 1, MAX_FRAME_QUEUE_SIZE, FLAGS },
+    { "async_streams", "Number of CUDA streams for concurrent processing", OFFSET(async_streams), AV_OPT_TYPE_INT, {.i64=DEFAULT_CUDA_STREAMS}, 1, MAX_CUDA_STREAMS, FLAGS },
 
     {NULL},
 };

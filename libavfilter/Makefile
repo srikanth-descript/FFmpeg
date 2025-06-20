@@ -35,6 +35,9 @@ OBJS-$(CONFIG_QSVVPP)                        += qsvvpp.o
 OBJS-$(CONFIG_SCENE_SAD)                     += scene_sad.o
 OBJS-$(CONFIG_DNN)                           += dnn_filter_common.o
 
+# CUDA async processing support
+OBJS-$(CONFIG_CUDA_ASYNC_QUEUE)             += cuda_async_queue.o
+
 # audio filters
 OBJS-$(CONFIG_AAP_FILTER)                    += af_aap.o
 OBJS-$(CONFIG_ABENCH_FILTER)                 += f_bench.o
