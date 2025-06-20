@@ -32,6 +32,7 @@
 
 #include "avfilter.h"
 #include "filters.h"
+#include "colorspace.h"
 
 #include "cuda/load_helper.h"
 
@@ -59,12 +60,55 @@ typedef struct CUDAColorspaceContext {
     CUstream cu_stream;
     CUmodule cu_module;
     CUfunction cu_convert[AVCOL_RANGE_NB];
+    CUfunction cu_convert_colorspace;
 
     enum AVPixelFormat pix_fmt;
     enum AVColorRange range;
+    enum AVColorSpace in_csp, out_csp, user_csp;
+    enum AVColorPrimaries in_prm, out_prm, user_prm;
+    enum AVColorTransferCharacteristic in_trc, out_trc, user_trc;
+
+    // Conversion matrices for YUV-to-YUV colorspace conversion
+    float yuv2yuv_matrix[3][3];
+    float yuv_offset[2]; // input and output offsets
+    int colorspace_conversion_needed;
 
     int num_planes;
 } CUDAColorspaceContext;
+
+static int calculate_yuv2yuv_matrix(CUDAColorspaceContext* s)
+{
+    const AVLumaCoefficients *in_lumacoef, *out_lumacoef;
+    double yuv2rgb[3][3], rgb2yuv[3][3], yuv2yuv[3][3];
+    int i, j;
+
+    // Get luma coefficients for input and output colorspaces
+    in_lumacoef = av_csp_luma_coeffs_from_avcsp(s->in_csp);
+    out_lumacoef = av_csp_luma_coeffs_from_avcsp(s->out_csp);
+
+    if (!in_lumacoef || !out_lumacoef) {
+        return AVERROR(EINVAL);
+    }
+
+    // Calculate YUV to RGB matrix for input colorspace
+    ff_fill_rgb2yuv_table(in_lumacoef, rgb2yuv);
+    ff_matrix_invert_3x3(rgb2yuv, yuv2rgb);
+
+    // Calculate RGB to YUV matrix for output colorspace
+    ff_fill_rgb2yuv_table(out_lumacoef, rgb2yuv);
+
+    // Combine: YUV_in -> RGB -> YUV_out
+    ff_matrix_mul_3x3(yuv2yuv, yuv2rgb, rgb2yuv);
+
+    // Convert to float for CUDA kernel
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            s->yuv2yuv_matrix[i][j] = (float)yuv2yuv[i][j];
+        }
+    }
+
+    return 0;
+}
 
 static av_cold int cudacolorspace_init(AVFilterContext* ctx)
 {
@@ -172,12 +216,28 @@ static av_cold int init_processing_chain(AVFilterContext* ctx, int width,
         return AVERROR(EINVAL);
     }
 
-    if ((AVCOL_RANGE_MPEG != s->range) && (AVCOL_RANGE_JPEG != s->range)) {
+    if ((AVCOL_RANGE_MPEG != s->range) && (AVCOL_RANGE_JPEG != s->range) && 
+        (AVCOL_RANGE_UNSPECIFIED != s->range)) {
         av_log(ctx, AV_LOG_ERROR, "Unsupported color range\n");
         return AVERROR(EINVAL);
     }
 
     s->num_planes = av_pix_fmt_count_planes(s->pix_fmt);
+
+    // Determine if colorspace conversion is needed
+    s->colorspace_conversion_needed = (s->in_csp != AVCOL_SPC_UNSPECIFIED && 
+                                       s->out_csp != AVCOL_SPC_UNSPECIFIED && 
+                                       s->in_csp != s->out_csp);
+
+    if (s->colorspace_conversion_needed) {
+        ret = calculate_yuv2yuv_matrix(s);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to calculate colorspace conversion matrix\n");
+            return ret;
+        }
+        av_log(ctx, AV_LOG_INFO, "Colorspace conversion: %s -> %s\n",
+               av_color_space_name(s->in_csp), av_color_space_name(s->out_csp));
+    }
 
     ret = init_hwframe_ctx(s, in_frames_ctx->device_ref, width, height);
     if (ret < 0)
@@ -218,6 +278,10 @@ static av_cold int cudacolorspace_load_functions(AVFilterContext* ctx)
     if (ret < 0)
         goto fail;
 
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_convert_colorspace, s->cu_module, "colorspace_convert_cuda"));
+    if (ret < 0)
+        goto fail;
+
 fail:
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return ret;
@@ -235,6 +299,19 @@ static av_cold int cudacolorspace_config_props(AVFilterLink* outlink)
 
     outlink->w = inlink->w;
     outlink->h = inlink->h;
+
+    // Set defaults - actual colorspace will be determined from frame properties
+    s->in_csp = inlink->colorspace != AVCOL_SPC_UNSPECIFIED ? inlink->colorspace : AVCOL_SPC_BT709;
+    s->in_prm = AVCOL_PRI_BT709;  // Default, will be updated from frame
+    s->in_trc = AVCOL_TRC_BT709;  // Default, will be updated from frame
+
+    // Set output colorspace properties
+    s->out_csp = s->user_csp != AVCOL_SPC_UNSPECIFIED ? s->user_csp : s->in_csp;
+    s->out_prm = s->user_prm != AVCOL_PRI_UNSPECIFIED ? s->user_prm : s->in_prm;
+    s->out_trc = s->user_trc != AVCOL_TRC_UNSPECIFIED ? s->user_trc : s->in_trc;
+
+    // Set output link properties
+    outlink->colorspace = s->out_csp;
 
     ret = init_processing_chain(ctx, inlink->w, inlink->h);
     if (ret < 0)
@@ -272,45 +349,108 @@ static int conv_cuda_convert(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
     if (ret < 0)
         return ret;
 
-    out->color_range = s->range;
+    // Update input colorspace properties from frame
+    s->in_csp = in->colorspace != AVCOL_SPC_UNSPECIFIED ? in->colorspace : s->in_csp;
+    s->in_prm = in->color_primaries != AVCOL_PRI_UNSPECIFIED ? in->color_primaries : s->in_prm;
+    s->in_trc = in->color_trc != AVCOL_TRC_UNSPECIFIED ? in->color_trc : s->in_trc;
 
-    for (int i = 0; i < s->num_planes; i++) {
-        int width = in->width, height = in->height, comp_id = (i > 0);
+    // Update output colorspace if user didn't specify
+    if (s->user_csp == AVCOL_SPC_UNSPECIFIED) s->out_csp = s->in_csp;
+    if (s->user_prm == AVCOL_PRI_UNSPECIFIED) s->out_prm = s->in_prm;
+    if (s->user_trc == AVCOL_TRC_UNSPECIFIED) s->out_trc = s->in_trc;
 
-        switch (s->pix_fmt) {
-        case AV_PIX_FMT_YUV444P:
-            break;
-        case AV_PIX_FMT_YUV420P:
-            width = comp_id ? in->width / 2 : in->width;
-            /* fall-through */
-        case AV_PIX_FMT_NV12:
-            height = comp_id ? in->height / 2 : in->height;
-            break;
-        default:
-            av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
-                   av_get_pix_fmt_name(s->pix_fmt));
-            return AVERROR(EINVAL);
-        }
-
-        if (!s->cu_convert[out->color_range]) {
-            av_log(ctx, AV_LOG_ERROR, "Unsupported color range\n");
-            return AVERROR(EINVAL);
-        }
-
-        if (in->color_range != out->color_range) {
-            void* args[] = {&in->data[i], &out->data[i], &in->linesize[i],
-                            &comp_id};
-            ret = CHECK_CU(cu->cuLaunchKernel(
-                s->cu_convert[out->color_range], DIV_UP(width, BLOCKX),
-                DIV_UP(height, BLOCKY), 1, BLOCKX, BLOCKY, 1, 0, s->cu_stream,
-                args, NULL));
-        } else {
-            ret = av_hwframe_transfer_data(out, in, 0);
-            if (ret < 0)
-                return ret;
+    // Check if we need to recalculate matrix
+    int need_recalc = (s->colorspace_conversion_needed && 
+                      (s->in_csp != s->out_csp));
+    
+    if (need_recalc) {
+        ret = calculate_yuv2yuv_matrix(s);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to recalculate colorspace conversion matrix\n");
+            goto fail;
         }
     }
 
+    // Set output frame properties
+    out->color_range = s->range != AVCOL_RANGE_UNSPECIFIED ? s->range : in->color_range;
+    out->colorspace = s->out_csp;
+    out->color_primaries = s->out_prm;
+    out->color_trc = s->out_trc;
+
+    // If only colorspace conversion is needed (no range conversion)
+    if (s->colorspace_conversion_needed && (in->color_range == out->color_range || s->range == AVCOL_RANGE_UNSPECIFIED)) {
+        for (int i = 0; i < s->num_planes; i++) {
+            int width = in->width, height = in->height;
+
+            switch (s->pix_fmt) {
+            case AV_PIX_FMT_YUV444P:
+                break;
+            case AV_PIX_FMT_YUV420P:
+                width = (i > 0) ? in->width / 2 : in->width;
+                /* fall-through */
+            case AV_PIX_FMT_NV12:
+                height = (i > 0) ? in->height / 2 : in->height;
+                break;
+            default:
+                av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
+                       av_get_pix_fmt_name(s->pix_fmt));
+                return AVERROR(EINVAL);
+            }
+
+            void* args[] = {&in->data[i], &out->data[i], &in->linesize[i], &out->linesize[i],
+                            &width, &height, &i, 
+                            &s->yuv2yuv_matrix[0][0], &s->yuv2yuv_matrix[0][1], &s->yuv2yuv_matrix[0][2],
+                            &s->yuv2yuv_matrix[1][0], &s->yuv2yuv_matrix[1][1], &s->yuv2yuv_matrix[1][2],
+                            &s->yuv2yuv_matrix[2][0], &s->yuv2yuv_matrix[2][1], &s->yuv2yuv_matrix[2][2]};
+            ret = CHECK_CU(cu->cuLaunchKernel(
+                s->cu_convert_colorspace, DIV_UP(width, BLOCKX),
+                DIV_UP(height, BLOCKY), 1, BLOCKX, BLOCKY, 1, 0, s->cu_stream,
+                args, NULL));
+            if (ret < 0)
+                goto fail;
+        }
+    } else {
+        // Handle range conversion or passthrough
+        for (int i = 0; i < s->num_planes; i++) {
+            int width = in->width, height = in->height, comp_id = (i > 0);
+
+            switch (s->pix_fmt) {
+            case AV_PIX_FMT_YUV444P:
+                break;
+            case AV_PIX_FMT_YUV420P:
+                width = comp_id ? in->width / 2 : in->width;
+                /* fall-through */
+            case AV_PIX_FMT_NV12:
+                height = comp_id ? in->height / 2 : in->height;
+                break;
+            default:
+                av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
+                       av_get_pix_fmt_name(s->pix_fmt));
+                return AVERROR(EINVAL);
+            }
+
+            if (s->range != AVCOL_RANGE_UNSPECIFIED && in->color_range != out->color_range) {
+                if (!s->cu_convert[out->color_range]) {
+                    av_log(ctx, AV_LOG_ERROR, "Unsupported color range\n");
+                    return AVERROR(EINVAL);
+                }
+
+                void* args[] = {&in->data[i], &out->data[i], &in->linesize[i], &comp_id};
+                ret = CHECK_CU(cu->cuLaunchKernel(
+                    s->cu_convert[out->color_range], DIV_UP(width, BLOCKX),
+                    DIV_UP(height, BLOCKY), 1, BLOCKX, BLOCKY, 1, 0, s->cu_stream,
+                    args, NULL));
+                if (ret < 0)
+                    goto fail;
+            } else {
+                ret = av_hwframe_transfer_data(out, in, 0);
+                if (ret < 0)
+                    goto fail;
+            }
+        }
+    }
+
+fail:
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return ret;
 }
@@ -392,6 +532,26 @@ static const AVOption options[] = {
         {"mpeg", "Limited range", 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, .unit = "range"},
         {"pc",   "Full range",    0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, .unit = "range"},
         {"jpeg", "Full range",    0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, .unit = "range"},
+
+    {"space", "Output colorspace", OFFSET(user_csp), AV_OPT_TYPE_INT, { .i64 = AVCOL_SPC_UNSPECIFIED }, AVCOL_SPC_RGB, AVCOL_SPC_NB - 1, FLAGS, .unit = "csp"},
+        {"bt709",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT709 },       0, 0, FLAGS, .unit = "csp"},
+        {"bt470bg",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT470BG },     0, 0, FLAGS, .unit = "csp"},
+        {"smpte170m",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_SMPTE170M },   0, 0, FLAGS, .unit = "csp"},
+        {"bt2020nc",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT2020_NCL },  0, 0, FLAGS, .unit = "csp"},
+        {"bt2020ncl",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT2020_NCL },  0, 0, FLAGS, .unit = "csp"},
+        {"bt601",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_SMPTE170M },   0, 0, FLAGS, .unit = "csp"},
+
+    {"primaries", "Output color primaries", OFFSET(user_prm), AV_OPT_TYPE_INT, { .i64 = AVCOL_PRI_UNSPECIFIED }, AVCOL_PRI_RESERVED0, AVCOL_PRI_NB - 1, FLAGS, .unit = "prm"},
+        {"bt709",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_PRI_BT709 },      0, 0, FLAGS, .unit = "prm"},
+        {"bt470bg",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_PRI_BT470BG },    0, 0, FLAGS, .unit = "prm"},
+        {"smpte170m",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_PRI_SMPTE170M },  0, 0, FLAGS, .unit = "prm"},
+        {"bt2020",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_PRI_BT2020 },     0, 0, FLAGS, .unit = "prm"},
+
+    {"trc", "Output transfer characteristics", OFFSET(user_trc), AV_OPT_TYPE_INT, { .i64 = AVCOL_TRC_UNSPECIFIED }, AVCOL_TRC_RESERVED0, AVCOL_TRC_NB - 1, FLAGS, .unit = "trc"},
+        {"bt709",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_TRC_BT709 },      0, 0, FLAGS, .unit = "trc"},
+        {"bt2020-10",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_TRC_BT2020_10 },  0, 0, FLAGS, .unit = "trc"},
+        {"smpte170m",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_TRC_SMPTE170M },  0, 0, FLAGS, .unit = "trc"},
+
     {NULL},
 };
 
