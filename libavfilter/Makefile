@@ -35,6 +35,7 @@ OBJS-$(CONFIG_QSVVPP)                        += qsvvpp.o
 OBJS-$(CONFIG_SCENE_SAD)                     += scene_sad.o
 OBJS-$(CONFIG_DNN)                           += dnn_filter_common.o
 
+
 # audio filters
 OBJS-$(CONFIG_AAP_FILTER)                    += af_aap.o
 OBJS-$(CONFIG_ABENCH_FILTER)                 += f_bench.o
@@ -248,7 +249,8 @@ OBJS-$(CONFIG_COLORMATRIX_FILTER)            += vf_colormatrix.o
 OBJS-$(CONFIG_COLORSPACE_FILTER)             += vf_colorspace.o colorspacedsp.o
 OBJS-$(CONFIG_COLORSPACE_CUDA_FILTER)        += vf_colorspace_cuda.o \
                                                 vf_colorspace_cuda.ptx.o \
-                                                cuda/load_helper.o
+                                                cuda/load_helper.o \
+                                                cuda/cuda_async_queue.o
 OBJS-$(CONFIG_COLORTEMPERATURE_FILTER)       += vf_colortemperature.o
 OBJS-$(CONFIG_CONVOLUTION_FILTER)            += vf_convolution.o
 OBJS-$(CONFIG_CONVOLUTION_OPENCL_FILTER)     += vf_convolution_opencl.o opencl.o \
@@ -379,6 +381,8 @@ OBJS-$(CONFIG_LUT1D_FILTER)                  += vf_lut3d.o
 OBJS-$(CONFIG_LUT_FILTER)                    += vf_lut.o
 OBJS-$(CONFIG_LUT2_FILTER)                   += vf_lut2.o framesync.o
 OBJS-$(CONFIG_LUT3D_FILTER)                  += vf_lut3d.o framesync.o
+OBJS-$(CONFIG_LUT3D_CUDA_FILTER)             += vf_lut3d_cuda.o \
+                                                vf_lut3d_cuda.ptx.o cuda/load_helper.o
 OBJS-$(CONFIG_LUTRGB_FILTER)                 += vf_lut.o
 OBJS-$(CONFIG_LUTYUV_FILTER)                 += vf_lut.o
 OBJS-$(CONFIG_MASKEDCLAMP_FILTER)            += vf_maskedclamp.o framesync.o
@@ -530,6 +534,9 @@ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o
 OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
 OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
 OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o
+OBJS-$(CONFIG_TONEMAP_CUDA_FILTER)           += vf_tonemap_cuda.o \
+                                                vf_tonemap_cuda.ptx.o cuda/load_helper.o \
+                                                cuda/cuda_async_queue.o
 OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o \
                                                 opencl/tonemap.o opencl/colorspace_common.o
 OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o
