@@ -238,17 +238,28 @@ __global__ void tonemap_cuda_p016_to_nv12(
     // Sample Y component (16-bit)
     unsigned short y_val = tex2D<unsigned short>(src_y_tex, x, y);
     
-    // Sample UV components (subsampled, 16-bit)
-    int uv_x = x / 2;
-    int uv_y = y / 2;
+    // Sample UV components (subsampled, 16-bit) - ensure consistent sampling for 2x2 blocks
+    int uv_x = (x / 2);
+    int uv_y = (y / 2);
     ushort2 uv_val = tex2D<ushort2>(src_uv_tex, uv_x, uv_y);
     
-    // Convert YUV to RGB (BT.2020 for HDR, 10-bit in 16-bit container)
-    float Y = (y_val - 64.0f * 64.0f) / (940.0f * 64.0f); // 10-bit scaling (shifted up by 6 bits in 16-bit)
-    float U = (uv_val.x - 512.0f * 64.0f) / (896.0f * 64.0f);
-    float V = (uv_val.y - 512.0f * 64.0f) / (896.0f * 64.0f);
+    // Convert YUV to RGB (BT.2020 for HDR, P016LE format: 10-bit left-justified in 16-bit)
+    // P016LE: 10-bit values are stored in upper 10 bits, so divide by 64 to get 10-bit range
+    // Add safety clamping to prevent extreme values
+    unsigned short y_10bit = y_val >> 6;
+    unsigned short u_10bit = uv_val.x >> 6;
+    unsigned short v_10bit = uv_val.y >> 6;
     
-    // BT.2020 YUV to RGB conversion
+    // Clamp to valid 10-bit TV range before normalization
+    y_10bit = max(64, min(940, (int)y_10bit));
+    u_10bit = max(64, min(960, (int)u_10bit));
+    v_10bit = max(64, min(960, (int)v_10bit));
+    
+    float Y = (y_10bit - 64.0f) / 876.0f; // 10-bit Y: range 64-940 -> 0.0-1.0
+    float U = (u_10bit - 512.0f) / 448.0f; // 10-bit U: range 64-960, centered at 512, scale by half-range
+    float V = (v_10bit - 512.0f) / 448.0f; // 10-bit V: range 64-960, centered at 512, scale by half-range
+    
+    // BT.2020 YUV to RGB conversion (corrected coefficients)
     float r = Y + 1.7166f * V;
     float g = Y - 0.1873f * U - 0.6526f * V;
     float b = Y + 2.0426f * U;
@@ -275,31 +286,42 @@ __global__ void tonemap_cuda_p016_to_nv12(
     
     // Apply the computed scale factor to the color
     float scale = sig / sig_orig;
+    
+    // Debug: clamp extreme scale values for hable to prevent artifacts
+    if (algorithm == TONEMAP_HABLE) {
+        scale = fmaxf(0.01f, fminf(10.0f, scale));
+    }
+    
     r *= scale;
     g *= scale;
     b *= scale;
     
-    // Convert back to YUV (BT.709 for SDR)
-    float out_Y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
-    float out_U = -0.1146f * r - 0.3854f * g + 0.5000f * b;
-    float out_V = 0.5000f * r - 0.4542f * g - 0.0458f * b;
+    // Clamp RGB to valid range [0.0, 1.0] before YUV conversion
+    r = fmaxf(0.0f, fminf(1.0f, r));
+    g = fmaxf(0.0f, fminf(1.0f, g));
+    b = fmaxf(0.0f, fminf(1.0f, b));
     
-    // Scale to 8-bit range
-    unsigned char y_out = (unsigned char)(out_Y * 219.0f + 16.0f + 0.5f);
-    unsigned char u_out = (unsigned char)(out_U * 224.0f + 128.0f + 0.5f);
-    unsigned char v_out = (unsigned char)(out_V * 224.0f + 128.0f + 0.5f);
+    // Convert back to YUV (BT.2020 to preserve input colorspace)
+    float out_Y = 0.2627f * r + 0.6780f * g + 0.0593f * b;
+    float out_U = -0.1396f * r - 0.3604f * g + 0.5000f * b;
+    float out_V = 0.5000f * r - 0.4598f * g - 0.0402f * b;
     
-    // Clamp to valid range
-    y_out = min(max(y_out, (unsigned char)16), (unsigned char)235);
-    u_out = min(max(u_out, (unsigned char)16), (unsigned char)240);
-    v_out = min(max(v_out, (unsigned char)16), (unsigned char)240);
+    // Scale to 8-bit TV range and clamp
+    int y_out = (int)(out_Y * 219.0f + 16.0f + 0.5f);
+    int u_out = (int)(out_U * 224.0f + 128.0f + 0.5f);
+    int v_out = (int)(out_V * 224.0f + 128.0f + 0.5f);
+    
+    // Clamp to valid TV range
+    y_out = max(16, min(235, y_out));
+    u_out = max(16, min(240, u_out));  // Proper TV range for chroma
+    v_out = max(16, min(240, v_out));
     
     // Write Y component
     dst_y[y * dst_pitch_y + x] = y_out;
     
-    // Write UV components in NV12 format (only for even pixels to maintain 4:2:0 subsampling)
+    // Write UV components in NV12 format (only for one thread per 2x2 block to avoid race conditions)
     if (x % 2 == 0 && y % 2 == 0) {
-        int uv_idx = (y / 2) * dst_pitch_uv + (x / 2) * 2;
+        int uv_idx = (y / 2) * dst_pitch_uv + (x / 2) * 2;  // Correct NV12 UV indexing
         dst_uv[uv_idx] = u_out;
         dst_uv[uv_idx + 1] = v_out;
     }

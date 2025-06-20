@@ -25,4 +25,4 @@
 
 #include "avfilter.h"
 
-#endif /* AVFILTER_VF_TONEMAP_CUDA_H */
+#endif                          /* AVFILTER_VF_TONEMAP_CUDA_H */

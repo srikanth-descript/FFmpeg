@@ -448,85 +448,6 @@ static int formats_declared(AVFilterContext *f)
  *          was made and the negotiation is stuck;
  *          a negative error code if some other error happened
  */
-static void describe_link_formats_cfg(AVFilterLink *link, AVFilterFormatsConfig *cfg, AVBPrint *bp)
-{
-    if (!link || !cfg)
-        return;
-        
-    av_bprintf(bp, "formats=");
-    if (cfg->formats && cfg->formats->nb_formats > 0) {
-        av_bprintf(bp, "[");
-        for (unsigned i = 0; i < cfg->formats->nb_formats; i++) {
-            if (i > 0) av_bprintf(bp, ", ");
-            if (link->type == AVMEDIA_TYPE_VIDEO) {
-                av_bprintf(bp, "%s", av_get_pix_fmt_name(cfg->formats->formats[i]));
-            } else if (link->type == AVMEDIA_TYPE_AUDIO) {
-                av_bprintf(bp, "%s", av_get_sample_fmt_name(cfg->formats->formats[i]));
-            } else {
-                av_bprintf(bp, "%d", cfg->formats->formats[i]);
-            }
-        }
-        av_bprintf(bp, "]");
-    } else {
-        av_bprintf(bp, "none");
-    }
-    
-    if (link->type == AVMEDIA_TYPE_AUDIO) {
-        av_bprintf(bp, ", sample_rates=");
-        if (cfg->samplerates && cfg->samplerates->nb_formats > 0) {
-            av_bprintf(bp, "[");
-            for (unsigned i = 0; i < cfg->samplerates->nb_formats; i++) {
-                if (i > 0) av_bprintf(bp, ", ");
-                av_bprintf(bp, "%d", cfg->samplerates->formats[i]);
-            }
-            av_bprintf(bp, "]");
-        } else {
-            av_bprintf(bp, "none");
-        }
-        
-        av_bprintf(bp, ", channel_layouts=");
-        if (cfg->channel_layouts && cfg->channel_layouts->nb_channel_layouts > 0) {
-            av_bprintf(bp, "[");
-            for (int i = 0; i < cfg->channel_layouts->nb_channel_layouts; i++) {
-                if (i > 0) av_bprintf(bp, ", ");
-                char buf[256];
-                av_channel_layout_describe(&cfg->channel_layouts->channel_layouts[i], buf, sizeof(buf));
-                av_bprintf(bp, "%s", buf);
-            }
-            av_bprintf(bp, "]");
-        } else if (cfg->channel_layouts && cfg->channel_layouts->all_layouts) {
-            av_bprintf(bp, "all");
-        } else {
-            av_bprintf(bp, "none");
-        }
-    } else if (link->type == AVMEDIA_TYPE_VIDEO) {
-        av_bprintf(bp, ", color_spaces=");
-        if (cfg->color_spaces && cfg->color_spaces->nb_formats > 0) {
-            av_bprintf(bp, "[");
-            for (unsigned i = 0; i < cfg->color_spaces->nb_formats; i++) {
-                if (i > 0) av_bprintf(bp, ", ");
-                av_bprintf(bp, "%s", av_color_space_name(cfg->color_spaces->formats[i]));
-            }
-            av_bprintf(bp, "]");
-        } else {
-            av_bprintf(bp, "none");
-        }
-        
-        av_bprintf(bp, ", color_ranges=");
-        if (cfg->color_ranges && cfg->color_ranges->nb_formats > 0) {
-            av_bprintf(bp, "[");
-            for (unsigned i = 0; i < cfg->color_ranges->nb_formats; i++) {
-                if (i > 0) av_bprintf(bp, ", ");
-                av_bprintf(bp, "%s", av_color_range_name(cfg->color_ranges->formats[i]));
-            }
-            av_bprintf(bp, "]");
-        } else {
-            av_bprintf(bp, "none");
-        }
-    }
-}
-
-
 static int query_formats(AVFilterGraph *graph, void *log_ctx)
 {
     int i, j, ret;
@@ -605,26 +526,6 @@ static int query_formats(AVFilterGraph *graph, void *log_ctx)
                 }
 
                 /* couldn't merge format lists. auto-insert conversion filter */
-                {
-                    AVBPrint src_formats, dst_formats;
-                    av_bprint_init(&src_formats, 0, AV_BPRINT_SIZE_AUTOMATIC);
-                    av_bprint_init(&dst_formats, 0, AV_BPRINT_SIZE_AUTOMATIC);
-                    
-                    describe_link_formats_cfg(link, &link->outcfg, &src_formats);
-                    describe_link_formats_cfg(link, &link->incfg, &dst_formats);
-                    
-                    av_log(log_ctx, AV_LOG_INFO,
-                           "Auto-inserting filter '%s' between filters '%s' and '%s'\n"
-                           "Source link supports: %s\n"
-                           "Destination link supports: %s\n",
-                           neg->conversion_filter, link->src->name, link->dst->name,
-                           src_formats.str ? src_formats.str : "unknown",
-                           dst_formats.str ? dst_formats.str : "unknown");
-                    
-                    av_bprint_finalize(&src_formats, NULL);
-                    av_bprint_finalize(&dst_formats, NULL);
-                }
-                
                 if (!(filter = avfilter_get_by_name(neg->conversion_filter))) {
                     av_log(log_ctx, AV_LOG_ERROR,
                            "'%s' filter not present, cannot convert formats.\n",
@@ -677,26 +578,9 @@ static int query_formats(AVFilterGraph *graph, void *log_ctx)
                         (ret = MERGE(m, outlink)) <= 0) {
                         if (ret < 0)
                             return ret;
-                        {
-                            AVBPrint inlink_formats, outlink_formats;
-                            av_bprint_init(&inlink_formats, 0, AV_BPRINT_SIZE_AUTOMATIC);
-                            av_bprint_init(&outlink_formats, 0, AV_BPRINT_SIZE_AUTOMATIC);
-                            
-                            describe_link_formats_cfg(inlink, &inlink->outcfg, &inlink_formats);
-                            describe_link_formats_cfg(outlink, &outlink->incfg, &outlink_formats);
-                            
-                            av_log(log_ctx, AV_LOG_ERROR,
-                                   "Impossible to convert between the formats supported by the filter "
-                                   "'%s' and the filter '%s'\n"
-                                   "Input link %s supports: %s\n"
-                                   "Output link %s supports: %s\n",
-                                   link->src->name, link->dst->name,
-                                   link->src->name, inlink_formats.str ? inlink_formats.str : "unknown",
-                                   link->dst->name, outlink_formats.str ? outlink_formats.str : "unknown");
-                            
-                            av_bprint_finalize(&inlink_formats, NULL);
-                            av_bprint_finalize(&outlink_formats, NULL);
-                        }
+                        av_log(log_ctx, AV_LOG_ERROR,
+                               "Impossible to convert between the formats supported by the filter "
+                               "'%s' and the filter '%s'\n", link->src->name, link->dst->name);
                         return AVERROR(ENOSYS);
                     }
                 }
