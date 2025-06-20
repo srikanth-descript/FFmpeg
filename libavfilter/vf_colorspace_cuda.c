@@ -532,40 +532,45 @@ static int cudacolorspace_filter_frame_async(AVFilterContext* ctx, AVFrame* in)
     // Get a free frame for processing
     async_frame = cuda_async_queue_get_free_frame(&s->async_queue);
     if (!async_frame) {
-        // Queue is full, wait for the oldest frame to complete
-        async_frame = &s->async_queue.frames[s->async_queue.head];
-        ret = cuda_async_queue_wait_for_completion(&s->async_queue, async_frame);
-        if (ret < 0)
-            return ret;
+        // Queue is full, wait for any frame to complete
+        cuda_async_queue_sync_all(&s->async_queue);
         
-        // Output the completed frame
-        AVFrame* completed_out = async_frame->output_frame;
-        async_frame->output_frame = NULL;
-        async_frame->in_use = 0;
-        s->async_queue.count--;
-        s->async_queue.head = (s->async_queue.head + 1) % s->async_queue.queue_size;
+        // Try to get a completed frame and output it
+        async_frame = cuda_async_queue_get_completed_frame(&s->async_queue);
+        if (async_frame) {
+            AVFrame* completed_out = async_frame->output_frame;
+            async_frame->output_frame = NULL;
+            
+            av_reduce(&completed_out->sample_aspect_ratio.num, &completed_out->sample_aspect_ratio.den,
+                      (int64_t)async_frame->frame->sample_aspect_ratio.num * outlink->h * inlink->w,
+                      (int64_t)async_frame->frame->sample_aspect_ratio.den * outlink->w * inlink->h,
+                      INT_MAX);
+            
+            ret = ff_filter_frame(outlink, completed_out);
+            if (ret < 0)
+                return ret;
+        }
         
-        av_reduce(&completed_out->sample_aspect_ratio.num, &completed_out->sample_aspect_ratio.den,
-                  (int64_t)async_frame->frame->sample_aspect_ratio.num * outlink->h * inlink->w,
-                  (int64_t)async_frame->frame->sample_aspect_ratio.den * outlink->w * inlink->h,
-                  INT_MAX);
-        
-        ret = ff_filter_frame(outlink, completed_out);
-        if (ret < 0)
-            return ret;
+        // Now get a free frame for new processing
+        async_frame = cuda_async_queue_get_free_frame(&s->async_queue);
+        if (!async_frame)
+            return AVERROR(EAGAIN);
     }
 
     // Setup input frame
     av_frame_move_ref(async_frame->frame, in);
     
-    // Allocate output frame buffer
-    async_frame->output_frame = av_frame_alloc();
-    if (!async_frame->output_frame)
-        return AVERROR(ENOMEM);
-    
+    // Reuse pre-allocated output frame buffer
     ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
     if (ret < 0)
         return ret;
+        
+    // Submit frame to queue BEFORE processing
+    ret = cuda_async_queue_submit_frame(&s->async_queue, async_frame);
+    if (ret < 0) {
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+        return ret;
+    }
         
     ret = cudacolorspace_conv(ctx, async_frame->output_frame, async_frame->frame);
     if (ret < 0) {
@@ -582,9 +587,6 @@ static int cudacolorspace_filter_frame_async(AVFilterContext* ctx, AVFrame* in)
     }
     
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-    
-    // Submit frame to queue
-    ret = cuda_async_queue_submit_frame(&s->async_queue, async_frame);
     if (ret < 0)
         return ret;
         

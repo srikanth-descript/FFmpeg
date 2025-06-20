@@ -175,9 +175,9 @@ CudaAsyncFrame* cuda_async_queue_get_free_frame(CudaAsyncQueue *queue)
     if (queue->count >= queue->queue_size)
         return NULL;
     
-    // Find a free frame
+    // Find a free frame - search all frames regardless of position
     for (i = 0; i < queue->queue_size; i++) {
-        async_frame = &queue->frames[(queue->head + i) % queue->queue_size];
+        async_frame = &queue->frames[i];
         if (!async_frame->in_use)
             return async_frame;
     }
