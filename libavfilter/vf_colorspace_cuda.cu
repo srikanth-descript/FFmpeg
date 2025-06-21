@@ -91,4 +91,36 @@ __global__ void to_mpeg_cuda(const unsigned char* src, unsigned char* dst,
     dst[x + y * pitch] = static_cast<unsigned char>(dst_);
 }
 
+__global__ void colorspace_convert_cuda(const unsigned char* src, unsigned char* dst,
+                                       int src_pitch, int dst_pitch, int width, int height, int plane_id,
+                                       float m00, float m01, float m02,
+                                       float m10, float m11, float m12,
+                                       float m20, float m21, float m22)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height)
+        return;
+
+    if (plane_id == 0) {
+        // Luma plane (Y) - apply only first row of matrix
+        float src_y = (float)src[x + y * src_pitch];
+        float dst_y = m00 * src_y + m01 * 128.0f + m02 * 128.0f;
+        dst[x + y * dst_pitch] = (unsigned char)clamp((int)(dst_y + 0.5f), 0, 255);
+    } else if (plane_id == 1) {
+        // U plane - apply second row of matrix, but we only have U component
+        float src_u = (float)src[x + y * src_pitch] - 128.0f;
+        // For U plane conversion, we apply the matrix considering U input and zero V
+        float dst_u = m10 * 128.0f + m11 * (src_u + 128.0f) + m12 * 128.0f;
+        dst[x + y * dst_pitch] = (unsigned char)clamp((int)(dst_u + 0.5f), 0, 255);
+    } else {
+        // V plane - apply third row of matrix, but we only have V component  
+        float src_v = (float)src[x + y * src_pitch] - 128.0f;
+        // For V plane conversion, we apply the matrix considering zero U input and V
+        float dst_v = m20 * 128.0f + m21 * 128.0f + m22 * (src_v + 128.0f);
+        dst[x + y * dst_pitch] = (unsigned char)clamp((int)(dst_v + 0.5f), 0, 255);
+    }
+}
+
 }
