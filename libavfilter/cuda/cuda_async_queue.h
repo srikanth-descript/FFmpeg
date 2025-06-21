@@ -36,6 +36,8 @@ typedef struct CudaAsyncFrame {
     int in_use;
     int stream_idx;
     int64_t submission_order;
+    int64_t submit_time_us;
+    int64_t complete_time_us;
 } CudaAsyncFrame;
 
 typedef struct CudaAsyncQueue {

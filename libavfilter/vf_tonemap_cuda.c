@@ -599,6 +599,29 @@ static int tonemap_cuda_activate(AVFilterContext *ctx)
     FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
 
     if (s->async_depth > 1 || s->async_streams > 1) {
+        // First, submit available input frames to fill the queue
+        while (!ff_cuda_async_queue_is_full(&s->async_queue)) {
+            ret = ff_inlink_consume_frame(inlink, &in);
+            if (ret < 0) {
+                if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
+                    break; // No more input frames available right now
+                }
+                return ret;
+            }
+            
+            if (in) {
+                ret = ff_cuda_async_queue_submit(&s->async_queue, in);
+                av_frame_free(&in);
+                if (ret < 0) {
+                    return ret;
+                }
+                av_log(ctx, AV_LOG_DEBUG, "Submitted frame to async queue\n");
+            } else {
+                break;
+            }
+        }
+
+        // Try to receive completed frames
         AVFrame *out = NULL;
         ret = ff_cuda_async_queue_receive(&s->async_queue, &out);
         if (ret == 0 && out) {
@@ -606,20 +629,22 @@ static int tonemap_cuda_activate(AVFilterContext *ctx)
         } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
             return ret;
         }
-    }
-
-    ret = ff_inlink_consume_frame(inlink, &in);
-    if (ret < 0)
-        return ret;
-    
-    if (in) {
-        ret = tonemap_cuda_filter_frame(inlink, in);
+    } else {
+        // Synchronous processing
+        ret = ff_inlink_consume_frame(inlink, &in);
         if (ret < 0)
             return ret;
+        
+        if (in) {
+            ret = tonemap_cuda_filter_frame(inlink, in);
+            if (ret < 0)
+                return ret;
+        }
     }
 
     if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
         if (s->async_depth > 1 || s->async_streams > 1) {
+            // Flush all remaining async frames
             while (!ff_cuda_async_queue_is_empty(&s->async_queue)) {
                 AVFrame *out = NULL;
                 ret = ff_cuda_async_queue_receive(&s->async_queue, &out);

@@ -19,6 +19,7 @@
  */
 
 #include <string.h>
+#include <sys/time.h>
 
 #include "cuda_async_queue.h"
 #include "libavutil/avassert.h"
@@ -33,6 +34,13 @@
         return AVERROR_EXTERNAL; \
     } \
 } while(0)
+
+static int64_t get_time_us(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000000LL + tv.tv_usec;
+}
 
 int ff_cuda_async_queue_init(CudaAsyncQueue *queue, AVCUDADeviceContext *hwctx,
                              int queue_size, int num_streams, void *filter_ctx,
@@ -152,8 +160,12 @@ int ff_cuda_async_queue_submit(CudaAsyncQueue *queue, AVFrame *in_frame)
     stream_idx = queue->submission_counter % queue->num_streams;
     async_frame->stream_idx = stream_idx;
     async_frame->submission_order = queue->submission_counter++;
+    async_frame->submit_time_us = get_time_us();
     
     CHECK_CU(cu->cuEventRecord(async_frame->event_start, queue->streams[stream_idx]));
+    
+    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Frame %"PRId64" submitted to stream %d (queue slot %d) at time %"PRId64"\n", 
+           async_frame->submission_order, stream_idx, queue->write_idx, async_frame->submit_time_us);
     
     ret = queue->process_frame(queue->filter_ctx, out_frame, async_frame->input_frame, 
                                queue->streams[stream_idx]);
@@ -162,13 +174,23 @@ int ff_cuda_async_queue_submit(CudaAsyncQueue *queue, AVFrame *in_frame)
         goto fail;
     }
     
+    // Don't synchronize here - let the kernel run asynchronously
+    // The synchronization will happen in ff_cuda_async_queue_receive
+    
     async_frame->output_frame = out_frame;
     
     CHECK_CU(cu->cuEventRecord(async_frame->event_done, queue->streams[stream_idx]));
     
+    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Frame %"PRId64" processing initiated on stream %d\n", 
+           async_frame->submission_order, stream_idx);
+    
     async_frame->in_use = 1;
     queue->write_idx = (queue->write_idx + 1) % queue->queue_size;
     queue->frames_in_queue++;
+    
+    // Log current queue status to show parallel activity
+    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Queue status: %d/%d frames active\n", 
+           queue->frames_in_queue, queue->queue_size);
     
     CHECK_CU(cu->cuCtxPopCurrent(NULL));
     
@@ -212,6 +234,13 @@ int ff_cuda_async_queue_receive(CudaAsyncQueue *queue, AVFrame **out_frame)
     }
     
     CHECK_CU(cu->cuEventSynchronize(async_frame->event_done));
+    
+    async_frame->complete_time_us = get_time_us();
+    int64_t processing_time = async_frame->complete_time_us - async_frame->submit_time_us;
+    
+    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Frame %"PRId64" completed on stream %d (queue slot %d) at time %"PRId64" - processing took %"PRId64"us\n", 
+           async_frame->submission_order, async_frame->stream_idx, queue->read_idx, 
+           async_frame->complete_time_us, processing_time);
     
     *out_frame = async_frame->output_frame;
     async_frame->output_frame = NULL;
