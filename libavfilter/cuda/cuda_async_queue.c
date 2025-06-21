@@ -164,7 +164,7 @@ int ff_cuda_async_queue_submit(CudaAsyncQueue *queue, AVFrame *in_frame)
     
     CHECK_CU(cu->cuEventRecord(async_frame->event_start, queue->streams[stream_idx]));
     
-    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Frame %"PRId64" submitted to stream %d (queue slot %d) at time %"PRId64"\n", 
+    av_log(NULL, AV_LOG_DEBUG, "[CUDA_ASYNC] Frame %"PRId64" submitted to stream %d (queue slot %d) at time %"PRId64"\n", 
            async_frame->submission_order, stream_idx, queue->write_idx, async_frame->submit_time_us);
     
     ret = queue->process_frame(queue->filter_ctx, out_frame, async_frame->input_frame, 
@@ -181,7 +181,7 @@ int ff_cuda_async_queue_submit(CudaAsyncQueue *queue, AVFrame *in_frame)
     
     CHECK_CU(cu->cuEventRecord(async_frame->event_done, queue->streams[stream_idx]));
     
-    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Frame %"PRId64" processing initiated on stream %d\n", 
+    av_log(NULL, AV_LOG_DEBUG, "[CUDA_ASYNC] Frame %"PRId64" processing initiated on stream %d\n", 
            async_frame->submission_order, stream_idx);
     
     async_frame->in_use = 1;
@@ -189,7 +189,7 @@ int ff_cuda_async_queue_submit(CudaAsyncQueue *queue, AVFrame *in_frame)
     queue->frames_in_queue++;
     
     // Log current queue status to show parallel activity
-    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Queue status: %d/%d frames active\n", 
+    av_log(NULL, AV_LOG_DEBUG, "[CUDA_ASYNC] Queue status: %d/%d frames active\n", 
            queue->frames_in_queue, queue->queue_size);
     
     CHECK_CU(cu->cuCtxPopCurrent(NULL));
@@ -238,7 +238,7 @@ int ff_cuda_async_queue_receive(CudaAsyncQueue *queue, AVFrame **out_frame)
     async_frame->complete_time_us = get_time_us();
     int64_t processing_time = async_frame->complete_time_us - async_frame->submit_time_us;
     
-    av_log(NULL, AV_LOG_INFO, "[CUDA_ASYNC] Frame %"PRId64" completed on stream %d (queue slot %d) at time %"PRId64" - processing took %"PRId64"us\n", 
+    av_log(NULL, AV_LOG_DEBUG, "[CUDA_ASYNC] Frame %"PRId64" completed on stream %d (queue slot %d) at time %"PRId64" - processing took %"PRId64"us\n", 
            async_frame->submission_order, async_frame->stream_idx, queue->read_idx, 
            async_frame->complete_time_us, processing_time);
     
