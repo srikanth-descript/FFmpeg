@@ -619,21 +619,21 @@ extern const FFFilter ff_avsrc_movie;
  * they are formatted to not be found by the grep
  * as they are manually added again (due to their 'names'
  * being the same while having different 'types'). */
-extern  const FFFilter ff_asrc_abuffer;
-extern  const FFFilter ff_vsrc_buffer;
-extern  const FFFilter ff_asink_abuffer;
-extern  const FFFilter ff_vsink_buffer;
+extern const FFFilter ff_asrc_abuffer;
+extern const FFFilter ff_vsrc_buffer;
+extern const FFFilter ff_asink_abuffer;
+extern const FFFilter ff_vsink_buffer;
 
 #include "libavfilter/filter_list.c"
 
 
 const AVFilter *av_filter_iterate(void **opaque)
 {
-    uintptr_t i = (uintptr_t)*opaque;
+    uintptr_t i = (uintptr_t) * opaque;
     const FFFilter *f = filter_list[i];
 
     if (f) {
-        *opaque = (void*)(i + 1);
+        *opaque = (void *) (i + 1);
         return &f->p;
     }
 
