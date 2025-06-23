@@ -526,6 +526,22 @@ static int query_formats(AVFilterGraph *graph, void *log_ctx)
                 }
 
                 /* couldn't merge format lists. auto-insert conversion filter */
+                
+                // Log format details for debugging
+                av_log(log_ctx, AV_LOG_INFO,
+                       "Auto-inserting filter '%s' between filters '%s' and '%s'\n",
+                       neg->conversion_filter, link->src->name, link->dst->name);
+                
+                av_log(log_ctx, AV_LOG_DEBUG,
+                       "Source filter '%s' output formats: %d\n",
+                       link->src->name, 
+                       link->outcfg.formats ? link->outcfg.formats->nb_formats : 0);
+                       
+                av_log(log_ctx, AV_LOG_DEBUG,
+                       "Destination filter '%s' input formats: %d\n", 
+                       link->dst->name,
+                       link->incfg.formats ? link->incfg.formats->nb_formats : 0);
+                
                 if (!(filter = avfilter_get_by_name(neg->conversion_filter))) {
                     av_log(log_ctx, AV_LOG_ERROR,
                            "'%s' filter not present, cannot convert formats.\n",
