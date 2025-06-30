@@ -28,6 +28,7 @@
 #include "libavutil/hwcontext_cuda_internal.h"
 #include "libavutil/cuda_check.h"
 #include "libavutil/internal.h"
+#include "colorspace.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/csp.h"
@@ -641,6 +642,10 @@ static int process_frame_async(void *filter_ctx, AVFrame * out,
     if (ret < 0)
         return ret;
 
+    // Ensure output frame has correct dimensions (not aligned dimensions)
+    out->width = in->width;
+    out->height = in->height;
+
     // Set the stream and call the kernel (kernel manages its own context)
     s->cu_stream = stream;
     ret = call_tonemap_kernel(ctx, out, in);
@@ -749,6 +754,12 @@ static int tonemap_cuda_filter_frame(AVFilterLink * link, AVFrame * in)
     if (s->passthrough)
         return ff_filter_frame(outlink, in);
 
+    /* read peak from side data if not passed in */
+    if (!s->peak) {
+        s->peak = ff_determine_signal_peak(in);
+        av_log(s, AV_LOG_DEBUG, "Computed signal peak: %f\n", s->peak);
+    }
+
     if (s->async_depth > 1 || s->async_streams > 1) {
         ret = ff_cuda_async_queue_submit(&s->async_queue, in);
         if (ret == AVERROR(EAGAIN)) {
@@ -807,6 +818,10 @@ static int tonemap_cuda_filter_frame(AVFilterLink * link, AVFrame * in)
     ret = av_hwframe_get_buffer(s->frames_ctx, out, 0);
     if (ret < 0)
         goto fail;
+
+    // Ensure output frame has correct dimensions (not aligned dimensions)
+    out->width = in->width;
+    out->height = in->height;
 
     ret = call_tonemap_kernel(ctx, out, in);
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
