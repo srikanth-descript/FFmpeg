@@ -465,7 +465,8 @@ static int conv_cuda_convert(AVFilterContext * ctx, AVFrame * out,
             goto fail;
         }
     }
-    // Set output frame properties
+    
+    // Set output frame properties immediately in conv function
     out->color_range =
         s->range != AVCOL_RANGE_UNSPECIFIED ? s->range : in->color_range;
     out->colorspace = s->out_csp;
@@ -604,6 +605,13 @@ static int cudacolorspace_conv(AVFilterContext * ctx, AVFrame * out,
     if (ret < 0)
         return ret;
 
+    // Set output frame properties AFTER av_frame_copy_props to avoid overwriting
+    out->color_range =
+        s->range != AVCOL_RANGE_UNSPECIFIED ? s->range : in->color_range;
+    out->colorspace = s->out_csp;
+    out->color_primaries = s->out_prm;
+    out->color_trc = s->out_trc;
+
     return 0;
 }
 
@@ -720,6 +728,14 @@ static int process_frame_async(void *filter_ctx, AVFrame * out,
 
     if (ret >= 0) {
         ret = av_frame_copy_props(out, in);
+        if (ret >= 0) {
+            // Set output frame properties AFTER av_frame_copy_props to avoid overwriting
+            out->color_range =
+                s->range != AVCOL_RANGE_UNSPECIFIED ? s->range : in->color_range;
+            out->colorspace = s->out_csp;
+            out->color_primaries = s->out_prm;
+            out->color_trc = s->out_trc;
+        }
     }
 
     return ret;
