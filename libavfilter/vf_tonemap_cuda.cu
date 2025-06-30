@@ -243,10 +243,11 @@ __global__ void tonemap_cuda_p016_to_nv12(
     int uv_y = y / 2;
     ushort2 uv_val = tex2D<ushort2>(src_uv_tex, uv_x, uv_y);
     
-    // Convert YUV to RGB (BT.2020 for HDR, 10-bit in 16-bit container)
-    float Y = (y_val - 64.0f * 64.0f) / (940.0f * 64.0f); // 10-bit scaling (shifted up by 6 bits in 16-bit)
-    float U = (uv_val.x - 512.0f * 64.0f) / (896.0f * 64.0f);
-    float V = (uv_val.y - 512.0f * 64.0f) / (896.0f * 64.0f);
+    // Convert YUV to RGB (BT.2020 for HDR, P016LE format: 10-bit left-justified in 16-bit)
+    // P016LE: 10-bit values are stored in upper 10 bits, so divide by 64 to get 10-bit range
+    float Y = ((y_val >> 6) - 64.0f) / 940.0f; // 10-bit Y: range 64-1023 -> 0.0-1.0
+    float U = ((uv_val.x >> 6) - 512.0f) / 896.0f; // 10-bit U: range 64-960 -> -0.5-0.5
+    float V = ((uv_val.y >> 6) - 512.0f) / 896.0f; // 10-bit V: range 64-960 -> -0.5-0.5
     
     // BT.2020 YUV to RGB conversion
     float r = Y + 1.7166f * V;
@@ -279,27 +280,32 @@ __global__ void tonemap_cuda_p016_to_nv12(
     g *= scale;
     b *= scale;
     
+    // Clamp RGB to valid range [0.0, 1.0] before YUV conversion
+    r = fmaxf(0.0f, fminf(1.0f, r));
+    g = fmaxf(0.0f, fminf(1.0f, g));
+    b = fmaxf(0.0f, fminf(1.0f, b));
+    
     // Convert back to YUV (BT.709 for SDR)
     float out_Y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
     float out_U = -0.1146f * r - 0.3854f * g + 0.5000f * b;
     float out_V = 0.5000f * r - 0.4542f * g - 0.0458f * b;
     
-    // Scale to 8-bit range
-    unsigned char y_out = (unsigned char)(out_Y * 219.0f + 16.0f + 0.5f);
-    unsigned char u_out = (unsigned char)(out_U * 224.0f + 128.0f + 0.5f);
-    unsigned char v_out = (unsigned char)(out_V * 224.0f + 128.0f + 0.5f);
+    // Scale to 8-bit TV range and clamp
+    int y_out = (int)(out_Y * 219.0f + 16.0f + 0.5f);
+    int u_out = (int)(out_U * 224.0f + 128.0f + 0.5f);
+    int v_out = (int)(out_V * 224.0f + 128.0f + 0.5f);
     
-    // Clamp to valid range
-    y_out = min(max(y_out, (unsigned char)16), (unsigned char)235);
-    u_out = min(max(u_out, (unsigned char)16), (unsigned char)240);
-    v_out = min(max(v_out, (unsigned char)16), (unsigned char)240);
+    // Clamp to valid TV range
+    y_out = max(16, min(235, y_out));
+    u_out = max(16, min(240, u_out));
+    v_out = max(16, min(240, v_out));
     
     // Write Y component
     dst_y[y * dst_pitch_y + x] = y_out;
     
-    // Write UV components in NV12 format (only for even pixels to maintain 4:2:0 subsampling)
+    // Write UV components in NV12 format (only for one thread per 2x2 block to avoid race conditions)
     if (x % 2 == 0 && y % 2 == 0) {
-        int uv_idx = (y / 2) * dst_pitch_uv + (x / 2) * 2;
+        int uv_idx = (y / 2) * dst_pitch_uv + x;
         dst_uv[uv_idx] = u_out;
         dst_uv[uv_idx + 1] = v_out;
     }
