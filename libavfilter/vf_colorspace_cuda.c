@@ -32,13 +32,16 @@
 
 #include "avfilter.h"
 #include "filters.h"
+#include "colorspace.h"
 
 #include "cuda/load_helper.h"
+#include "cuda/cuda_async_queue.h"
 
 static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_NV12,
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_P016LE,
 };
 
 #define DIV_UP(a, b) (((a) + (b)-1) / (b))
@@ -48,27 +51,79 @@ static const enum AVPixelFormat supported_formats[] = {
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(ctx, s->hwctx->internal->cuda_dl, x)
 
 typedef struct CUDAColorspaceContext {
-    const AVClass* class;
+    const AVClass *class;
 
-    AVCUDADeviceContext* hwctx;
-    AVBufferRef* frames_ctx;
-    AVFrame* own_frame;
-    AVFrame* tmp_frame;
+    AVCUDADeviceContext *hwctx;
+    AVBufferRef *frames_ctx;
+    AVFrame *own_frame;
+    AVFrame *tmp_frame;
 
     CUcontext cu_ctx;
     CUstream cu_stream;
     CUmodule cu_module;
     CUfunction cu_convert[AVCOL_RANGE_NB];
+    CUfunction cu_convert_colorspace;
+    CUfunction cu_convert_colorspace_yuv;
+    CUfunction cu_convert_colorspace_nv12;
+    CUfunction cu_convert_16[AVCOL_RANGE_NB];
+    CUfunction cu_convert_colorspace_16;
+    CUfunction cu_convert_colorspace_yuv_16;
+
 
     enum AVPixelFormat pix_fmt;
     enum AVColorRange range;
+    enum AVColorSpace in_csp, out_csp, user_csp;
+    enum AVColorPrimaries in_prm, out_prm, user_prm;
+    enum AVColorTransferCharacteristic in_trc, out_trc, user_trc;
+
+    // Conversion matrices for YUV-to-YUV colorspace conversion
+    float yuv2yuv_matrix[3][3];
+    float yuv_offset[2];        // input and output offsets
+    int colorspace_conversion_needed;
 
     int num_planes;
+
+    int async_depth;
+    int async_streams;
+    CudaAsyncQueue async_queue;
 } CUDAColorspaceContext;
 
-static av_cold int cudacolorspace_init(AVFilterContext* ctx)
+static int calculate_yuv2yuv_matrix(CUDAColorspaceContext * s)
 {
-    CUDAColorspaceContext* s = ctx->priv;
+    const AVLumaCoefficients *in_lumacoef, *out_lumacoef;
+    double yuv2rgb[3][3], rgb2yuv[3][3], yuv2yuv[3][3];
+    int i, j;
+
+    // Get luma coefficients for input and output colorspaces
+    in_lumacoef = av_csp_luma_coeffs_from_avcsp(s->in_csp);
+    out_lumacoef = av_csp_luma_coeffs_from_avcsp(s->out_csp);
+
+    if (!in_lumacoef || !out_lumacoef) {
+        return AVERROR(EINVAL);
+    }
+    // Calculate YUV to RGB matrix for input colorspace
+    ff_fill_rgb2yuv_table(in_lumacoef, rgb2yuv);
+    ff_matrix_invert_3x3(rgb2yuv, yuv2rgb);
+
+    // Calculate RGB to YUV matrix for output colorspace
+    ff_fill_rgb2yuv_table(out_lumacoef, rgb2yuv);
+
+    // Combine: YUV_in -> RGB -> YUV_out
+    ff_matrix_mul_3x3(yuv2yuv, yuv2rgb, rgb2yuv);
+
+    // Convert to float for CUDA kernel
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            s->yuv2yuv_matrix[i][j] = (float) yuv2yuv[i][j];
+        }
+    }
+
+    return 0;
+}
+
+static av_cold int cudacolorspace_init(AVFilterContext * ctx)
+{
+    CUDAColorspaceContext *s = ctx->priv;
 
     s->own_frame = av_frame_alloc();
     if (!s->own_frame)
@@ -78,15 +133,21 @@ static av_cold int cudacolorspace_init(AVFilterContext* ctx)
     if (!s->tmp_frame)
         return AVERROR(ENOMEM);
 
+
     return 0;
 }
 
-static av_cold void cudacolorspace_uninit(AVFilterContext* ctx)
+static int process_frame_async(void *filter_ctx, AVFrame * out,
+                               AVFrame * in, CUstream stream);
+static int cudacolorspace_filter_frame(AVFilterLink * link, AVFrame * in);
+
+static av_cold void cudacolorspace_uninit(AVFilterContext * ctx)
 {
-    CUDAColorspaceContext* s = ctx->priv;
+    CUDAColorspaceContext *s = ctx->priv;
+
 
     if (s->hwctx && s->cu_module) {
-        CudaFunctions* cu = s->hwctx->internal->cuda_dl;
+        CudaFunctions *cu = s->hwctx->internal->cuda_dl;
         CUcontext dummy;
 
         CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
@@ -96,22 +157,30 @@ static av_cold void cudacolorspace_uninit(AVFilterContext* ctx)
     }
 
     av_frame_free(&s->own_frame);
-    av_buffer_unref(&s->frames_ctx);
     av_frame_free(&s->tmp_frame);
+
+    // Clean up async queue BEFORE freeing frames_ctx to ensure
+    // that async frames can properly return their buffer references
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        ff_cuda_async_queue_uninit(&s->async_queue);
+    }
+
+    av_buffer_unref(&s->frames_ctx);
 }
 
-static av_cold int init_hwframe_ctx(CUDAColorspaceContext* s, AVBufferRef* device_ctx,
-                                    int width, int height)
+static av_cold int init_hwframe_ctx(CUDAColorspaceContext * s,
+                                    AVBufferRef * device_ctx, int width,
+                                    int height)
 {
-    AVBufferRef* out_ref = NULL;
-    AVHWFramesContext* out_ctx;
+    AVBufferRef *out_ref = NULL;
+    AVHWFramesContext *out_ctx;
     int ret;
 
     out_ref = av_hwframe_ctx_alloc(device_ctx);
     if (!out_ref)
         return AVERROR(ENOMEM);
 
-    out_ctx = (AVHWFramesContext*)out_ref->data;
+    out_ctx = (AVHWFramesContext *) out_ref->data;
 
     out_ctx->format = AV_PIX_FMT_CUDA;
     out_ctx->sw_format = s->pix_fmt;
@@ -134,7 +203,7 @@ static av_cold int init_hwframe_ctx(CUDAColorspaceContext* s, AVBufferRef* devic
     s->frames_ctx = out_ref;
 
     return 0;
-fail:
+  fail:
     av_buffer_unref(&out_ref);
     return ret;
 }
@@ -148,13 +217,18 @@ static int format_is_supported(enum AVPixelFormat fmt)
     return 0;
 }
 
-static av_cold int init_processing_chain(AVFilterContext* ctx, int width,
+static int format_is_16bit(enum AVPixelFormat fmt)
+{
+    return fmt == AV_PIX_FMT_P016LE;
+}
+
+static av_cold int init_processing_chain(AVFilterContext * ctx, int width,
                                          int height)
 {
-    FilterLink          *inl = ff_filter_link(ctx->inputs[0]);
-    FilterLink         *outl = ff_filter_link(ctx->outputs[0]);
-    CUDAColorspaceContext* s = ctx->priv;
-    AVHWFramesContext* in_frames_ctx;
+    FilterLink *inl = ff_filter_link(ctx->inputs[0]);
+    FilterLink *outl = ff_filter_link(ctx->outputs[0]);
+    CUDAColorspaceContext *s = ctx->priv;
+    AVHWFramesContext *in_frames_ctx;
 
     int ret;
 
@@ -163,7 +237,7 @@ static av_cold int init_processing_chain(AVFilterContext* ctx, int width,
         return AVERROR(EINVAL);
     }
 
-    in_frames_ctx = (AVHWFramesContext*)inl->hw_frames_ctx->data;
+    in_frames_ctx = (AVHWFramesContext *) inl->hw_frames_ctx->data;
     s->pix_fmt = in_frames_ctx->sw_format;
 
     if (!format_is_supported(s->pix_fmt)) {
@@ -172,12 +246,31 @@ static av_cold int init_processing_chain(AVFilterContext* ctx, int width,
         return AVERROR(EINVAL);
     }
 
-    if ((AVCOL_RANGE_MPEG != s->range) && (AVCOL_RANGE_JPEG != s->range)) {
+    if ((AVCOL_RANGE_MPEG != s->range) && (AVCOL_RANGE_JPEG != s->range) &&
+        (AVCOL_RANGE_UNSPECIFIED != s->range)) {
         av_log(ctx, AV_LOG_ERROR, "Unsupported color range\n");
         return AVERROR(EINVAL);
     }
 
     s->num_planes = av_pix_fmt_count_planes(s->pix_fmt);
+
+    // Determine if colorspace conversion is needed
+    s->colorspace_conversion_needed = (s->in_csp != AVCOL_SPC_UNSPECIFIED
+                                       && s->out_csp !=
+                                       AVCOL_SPC_UNSPECIFIED
+                                       && s->in_csp != s->out_csp);
+
+    if (s->colorspace_conversion_needed) {
+        ret = calculate_yuv2yuv_matrix(s);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Failed to calculate colorspace conversion matrix\n");
+            return ret;
+        }
+        av_log(ctx, AV_LOG_INFO, "Colorspace conversion: %s -> %s\n",
+               av_color_space_name(s->in_csp),
+               av_color_space_name(s->out_csp));
+    }
 
     ret = init_hwframe_ctx(s, in_frames_ctx->device_ref, width, height);
     if (ret < 0)
@@ -190,11 +283,11 @@ static av_cold int init_processing_chain(AVFilterContext* ctx, int width,
     return 0;
 }
 
-static av_cold int cudacolorspace_load_functions(AVFilterContext* ctx)
+static av_cold int cudacolorspace_load_functions(AVFilterContext * ctx)
 {
-    CUDAColorspaceContext* s = ctx->priv;
+    CUDAColorspaceContext *s = ctx->priv;
     CUcontext dummy, cuda_ctx = s->hwctx->cuda_ctx;
-    CudaFunctions* cu = s->hwctx->internal->cuda_dl;
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
     int ret;
 
     extern const unsigned char ff_vf_colorspace_cuda_ptx_data[];
@@ -210,46 +303,127 @@ static av_cold int cudacolorspace_load_functions(AVFilterContext* ctx)
     if (ret < 0)
         goto fail;
 
-    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_convert[AVCOL_RANGE_MPEG], s->cu_module, "to_mpeg_cuda"));
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert[AVCOL_RANGE_MPEG],
+                                     s->cu_module, "to_mpeg_cuda"));
     if (ret < 0)
         goto fail;
 
-    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_convert[AVCOL_RANGE_JPEG], s->cu_module, "to_jpeg_cuda"));
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert[AVCOL_RANGE_JPEG],
+                                     s->cu_module, "to_jpeg_cuda"));
     if (ret < 0)
         goto fail;
 
-fail:
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_colorspace,
+                                     s->cu_module,
+                                     "colorspace_convert_cuda"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_colorspace_yuv,
+                                     s->cu_module,
+                                     "colorspace_convert_yuv_cuda"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_colorspace_nv12,
+                                     s->cu_module,
+                                     "colorspace_convert_nv12_cuda"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_16[AVCOL_RANGE_MPEG],
+                                     s->cu_module, "to_mpeg_cuda_16"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_16[AVCOL_RANGE_JPEG],
+                                     s->cu_module, "to_jpeg_cuda_16"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_colorspace_16,
+                                     s->cu_module,
+                                     "colorspace_convert_cuda_16"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_colorspace_yuv_16,
+                                     s->cu_module,
+                                     "colorspace_convert_yuv_cuda_16"));
+    if (ret < 0)
+        goto fail;
+
+  fail:
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return ret;
 }
 
-static av_cold int cudacolorspace_config_props(AVFilterLink* outlink)
+static av_cold int cudacolorspace_config_props(AVFilterLink * outlink)
 {
-    AVFilterContext* ctx = outlink->src;
-    AVFilterLink* inlink = outlink->src->inputs[0];
-    FilterLink      *inl = ff_filter_link(inlink);
-    CUDAColorspaceContext* s = ctx->priv;
-    AVHWFramesContext* frames_ctx;
-    AVCUDADeviceContext* device_hwctx;
+    AVFilterContext *ctx = outlink->src;
+    AVFilterLink *inlink = outlink->src->inputs[0];
+    FilterLink *inl = ff_filter_link(inlink);
+    CUDAColorspaceContext *s = ctx->priv;
+    AVHWFramesContext *frames_ctx;
+    AVCUDADeviceContext *device_hwctx;
     int ret;
 
     outlink->w = inlink->w;
     outlink->h = inlink->h;
 
+    // Set defaults - actual colorspace will be determined from frame properties
+    s->in_csp =
+        inlink->colorspace !=
+        AVCOL_SPC_UNSPECIFIED ? inlink->colorspace : AVCOL_SPC_BT709;
+    s->in_prm = AVCOL_PRI_BT709;        // Default, will be updated from frame
+    s->in_trc = AVCOL_TRC_BT709;        // Default, will be updated from frame
+
+    // Set output colorspace properties
+    s->out_csp =
+        s->user_csp != AVCOL_SPC_UNSPECIFIED ? s->user_csp : s->in_csp;
+    s->out_prm =
+        s->user_prm != AVCOL_PRI_UNSPECIFIED ? s->user_prm : s->in_prm;
+    s->out_trc =
+        s->user_trc != AVCOL_TRC_UNSPECIFIED ? s->user_trc : s->in_trc;
+
+    // Set output link properties
+    outlink->colorspace = s->out_csp;
+
     ret = init_processing_chain(ctx, inlink->w, inlink->h);
     if (ret < 0)
         return ret;
 
-    frames_ctx = (AVHWFramesContext*)inl->hw_frames_ctx->data;
+    frames_ctx = (AVHWFramesContext *) inl->hw_frames_ctx->data;
     device_hwctx = frames_ctx->device_ctx->hwctx;
 
     s->hwctx = device_hwctx;
     s->cu_stream = s->hwctx->stream;
 
     if (inlink->sample_aspect_ratio.num) {
-        outlink->sample_aspect_ratio = av_mul_q(
-            (AVRational){outlink->h * inlink->w, outlink->w * inlink->h},
-            inlink->sample_aspect_ratio);
+        outlink->sample_aspect_ratio = av_mul_q((AVRational) {
+                                                outlink->h * inlink->w,
+                                                outlink->w * inlink->h}
+                                                ,
+                                                inlink->
+                                                sample_aspect_ratio);
     } else {
         outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
     }
@@ -258,13 +432,29 @@ static av_cold int cudacolorspace_config_props(AVFilterLink* outlink)
     if (ret < 0)
         return ret;
 
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        av_log(ctx, AV_LOG_DEBUG,
+               "Async processing enabled: depth=%d streams=%d\n",
+               s->async_depth, s->async_streams);
+
+        ret = ff_cuda_async_queue_init(&s->async_queue, s->hwctx,
+                                       s->async_depth, s->async_streams,
+                                       ctx, process_frame_async);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Failed to initialize async queue\n");
+            return ret;
+        }
+    }
+
     return ret;
 }
 
-static int conv_cuda_convert(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
+static int conv_cuda_convert(AVFilterContext * ctx, AVFrame * out,
+                             AVFrame * in)
 {
-    CUDAColorspaceContext* s = ctx->priv;
-    CudaFunctions* cu = s->hwctx->internal->cuda_dl;
+    CUDAColorspaceContext *s = ctx->priv;
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
     CUcontext dummy, cuda_ctx = s->hwctx->cuda_ctx;
     int ret;
 
@@ -272,54 +462,238 @@ static int conv_cuda_convert(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
     if (ret < 0)
         return ret;
 
-    out->color_range = s->range;
+    // Update input colorspace properties from frame
+    s->in_csp =
+        in->colorspace !=
+        AVCOL_SPC_UNSPECIFIED ? in->colorspace : s->in_csp;
+    s->in_prm =
+        in->color_primaries !=
+        AVCOL_PRI_UNSPECIFIED ? in->color_primaries : s->in_prm;
+    s->in_trc =
+        in->color_trc != AVCOL_TRC_UNSPECIFIED ? in->color_trc : s->in_trc;
 
-    for (int i = 0; i < s->num_planes; i++) {
-        int width = in->width, height = in->height, comp_id = (i > 0);
+    // Update output colorspace if user didn't specify
+    if (s->user_csp == AVCOL_SPC_UNSPECIFIED)
+        s->out_csp = s->in_csp;
+    if (s->user_prm == AVCOL_PRI_UNSPECIFIED)
+        s->out_prm = s->in_prm;
+    if (s->user_trc == AVCOL_TRC_UNSPECIFIED)
+        s->out_trc = s->in_trc;
 
+    // Check if we need to recalculate matrix
+    int need_recalc = (s->colorspace_conversion_needed &&
+                       (s->in_csp != s->out_csp));
+
+    if (need_recalc) {
+        ret = calculate_yuv2yuv_matrix(s);
+        if (ret < 0) {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Failed to recalculate colorspace conversion matrix\n");
+            goto fail;
+        }
+    }
+    
+    // Set output frame properties immediately in conv function
+    out->color_range =
+        s->range != AVCOL_RANGE_UNSPECIFIED ? s->range : in->color_range;
+    out->colorspace = s->out_csp;
+    out->color_primaries = s->out_prm;
+    out->color_trc = s->out_trc;
+
+    // If only colorspace conversion is needed (no range conversion)
+    if (s->colorspace_conversion_needed
+        && (in->color_range == out->color_range
+            || s->range == AVCOL_RANGE_UNSPECIFIED)) {
+        
+        // Check if we can use the new YUV kernel
+        int use_yuv_kernel = 0;
+        int use_nv12_kernel = 0;
         switch (s->pix_fmt) {
         case AV_PIX_FMT_YUV444P:
-            break;
         case AV_PIX_FMT_YUV420P:
-            width = comp_id ? in->width / 2 : in->width;
-            /* fall-through */
+        case AV_PIX_FMT_P016LE:
+            use_yuv_kernel = 1;
+            break;
         case AV_PIX_FMT_NV12:
-            height = comp_id ? in->height / 2 : in->height;
+            use_nv12_kernel = 1;
             break;
         default:
-            av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
-                   av_get_pix_fmt_name(s->pix_fmt));
-            return AVERROR(EINVAL);
+            // Fall back to per-plane conversion for other formats
+            use_yuv_kernel = 0;
+            use_nv12_kernel = 0;
+            break;
         }
+        
+        if (use_yuv_kernel) {
+            // Use new YUV kernel for proper colorspace conversion
+            int width = in->width, height = in->height;
+            int src_pitch_uv = in->linesize[1];
+            int dst_pitch_uv = out->linesize[1];
 
-        if (!s->cu_convert[out->color_range]) {
-            av_log(ctx, AV_LOG_ERROR, "Unsupported color range\n");
-            return AVERROR(EINVAL);
-        }
-
-        if (in->color_range != out->color_range) {
-            void* args[] = {&in->data[i], &out->data[i], &in->linesize[i],
-                            &comp_id};
-            ret = CHECK_CU(cu->cuLaunchKernel(
-                s->cu_convert[out->color_range], DIV_UP(width, BLOCKX),
-                DIV_UP(height, BLOCKY), 1, BLOCKX, BLOCKY, 1, 0, s->cu_stream,
-                args, NULL));
-        } else {
-            ret = av_hwframe_transfer_data(out, in, 0);
+            if (format_is_16bit(s->pix_fmt)) {
+                // 16-bit YUV conversion
+                void *args[] = {
+                    &in->data[0], &in->data[1], &in->data[2],    // src Y, U, V
+                    &out->data[0], &out->data[1], &out->data[2], // dst Y, U, V
+                    &in->linesize[0], &src_pitch_uv,             // src pitches
+                    &out->linesize[0], &dst_pitch_uv,            // dst pitches
+                    &width, &height,
+                    &s->yuv2yuv_matrix[0][0], &s->yuv2yuv_matrix[0][1], &s->yuv2yuv_matrix[0][2],
+                    &s->yuv2yuv_matrix[1][0], &s->yuv2yuv_matrix[1][1], &s->yuv2yuv_matrix[1][2],
+                    &s->yuv2yuv_matrix[2][0], &s->yuv2yuv_matrix[2][1], &s->yuv2yuv_matrix[2][2]
+                };
+                ret = CHECK_CU(cu->cuLaunchKernel(s->cu_convert_colorspace_yuv_16,
+                                                DIV_UP(width, BLOCKX), DIV_UP(height, BLOCKY), 1,
+                                                BLOCKX, BLOCKY, 1, 0, s->cu_stream, args, NULL));
+            } else {
+                // 8-bit YUV conversion
+                void *args[] = {
+                    &in->data[0], &in->data[1], &in->data[2],    // src Y, U, V
+                    &out->data[0], &out->data[1], &out->data[2], // dst Y, U, V
+                    &in->linesize[0], &src_pitch_uv,             // src pitches
+                    &out->linesize[0], &dst_pitch_uv,            // dst pitches
+                    &width, &height,
+                    &s->yuv2yuv_matrix[0][0], &s->yuv2yuv_matrix[0][1], &s->yuv2yuv_matrix[0][2],
+                    &s->yuv2yuv_matrix[1][0], &s->yuv2yuv_matrix[1][1], &s->yuv2yuv_matrix[1][2],
+                    &s->yuv2yuv_matrix[2][0], &s->yuv2yuv_matrix[2][1], &s->yuv2yuv_matrix[2][2]
+                };
+                ret = CHECK_CU(cu->cuLaunchKernel(s->cu_convert_colorspace_yuv,
+                                                DIV_UP(width, BLOCKX), DIV_UP(height, BLOCKY), 1,
+                                                BLOCKX, BLOCKY, 1, 0, s->cu_stream, args, NULL));
+            }
+            
             if (ret < 0)
-                return ret;
+                goto fail;
+        } else if (use_nv12_kernel) {
+            // Use NV12 kernel for proper colorspace conversion
+            int width = in->width, height = in->height;
+
+            void *args[] = {
+                &in->data[0], &in->data[1],                  // src Y, UV planes
+                &out->data[0], &out->data[1],                // dst Y, UV planes
+                &in->linesize[0], &in->linesize[1],          // src pitches
+                &out->linesize[0], &out->linesize[1],        // dst pitches
+                &width, &height,
+                &s->yuv2yuv_matrix[0][0], &s->yuv2yuv_matrix[0][1], &s->yuv2yuv_matrix[0][2],
+                &s->yuv2yuv_matrix[1][0], &s->yuv2yuv_matrix[1][1], &s->yuv2yuv_matrix[1][2],
+                &s->yuv2yuv_matrix[2][0], &s->yuv2yuv_matrix[2][1], &s->yuv2yuv_matrix[2][2]
+            };
+            ret = CHECK_CU(cu->cuLaunchKernel(s->cu_convert_colorspace_nv12,
+                                            DIV_UP(width, BLOCKX), DIV_UP(height, BLOCKY), 1,
+                                            BLOCKX, BLOCKY, 1, 0, s->cu_stream, args, NULL));
+            
+            if (ret < 0)
+                goto fail;
+        } else {
+            // Fall back to original per-plane conversion for NV12 and other formats
+            for (int i = 0; i < s->num_planes; i++) {
+                int width = in->width, height = in->height;
+
+                switch (s->pix_fmt) {
+                case AV_PIX_FMT_YUV444P:
+                    break;
+                case AV_PIX_FMT_YUV420P:
+                    width = (i > 0) ? in->width / 2 : in->width;
+                    /* fall-through */
+                case AV_PIX_FMT_NV12:
+                    height = (i > 0) ? in->height / 2 : in->height;
+                    break;
+                case AV_PIX_FMT_P016LE:
+                    height = (i > 0) ? in->height / 2 : in->height;
+                    break;
+                default:
+                    av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
+                           av_get_pix_fmt_name(s->pix_fmt));
+                    return AVERROR(EINVAL);
+                }
+
+                void *args[] =
+                    { &in->data[i], &out->data[i], &in->linesize[i],
+             &out->linesize[i],
+                    &width, &height, &i,
+                    &s->yuv2yuv_matrix[0][0], &s->yuv2yuv_matrix[0][1],
+                        &s->yuv2yuv_matrix[0][2],
+                    &s->yuv2yuv_matrix[1][0], &s->yuv2yuv_matrix[1][1],
+                        &s->yuv2yuv_matrix[1][2],
+                    &s->yuv2yuv_matrix[2][0], &s->yuv2yuv_matrix[2][1],
+                        &s->yuv2yuv_matrix[2][2]
+                };
+                CUfunction kernel = format_is_16bit(s->pix_fmt) ? 
+                                    s->cu_convert_colorspace_16 : s->cu_convert_colorspace;
+                ret =
+                    CHECK_CU(cu->
+                             cuLaunchKernel(kernel,
+                                            DIV_UP(width, BLOCKX),
+                                            DIV_UP(height, BLOCKY), 1, BLOCKX,
+                                            BLOCKY, 1, 0, s->cu_stream, args,
+                                            NULL));
+                if (ret < 0)
+                    goto fail;
+            }
+        }
+    } else {
+        // Handle range conversion or passthrough
+        for (int i = 0; i < s->num_planes; i++) {
+            int width = in->width, height = in->height, comp_id = (i > 0);
+
+            switch (s->pix_fmt) {
+            case AV_PIX_FMT_YUV444P:
+                break;
+            case AV_PIX_FMT_YUV420P:
+                width = comp_id ? in->width / 2 : in->width;
+                /* fall-through */
+            case AV_PIX_FMT_NV12:
+                height = comp_id ? in->height / 2 : in->height;
+                break;
+            case AV_PIX_FMT_P016LE:
+                height = comp_id ? in->height / 2 : in->height;
+                break;
+            default:
+                av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
+                       av_get_pix_fmt_name(s->pix_fmt));
+                return AVERROR(EINVAL);
+            }
+
+            if (s->range != AVCOL_RANGE_UNSPECIFIED
+                && in->color_range != out->color_range) {
+                CUfunction *convert_funcs = format_is_16bit(s->pix_fmt) ? 
+                                           s->cu_convert_16 : s->cu_convert;
+                if (!convert_funcs[out->color_range]) {
+                    av_log(ctx, AV_LOG_ERROR, "Unsupported color range\n");
+                    return AVERROR(EINVAL);
+                }
+
+                void *args[] =
+                    { &in->data[i], &out->data[i], &in->linesize[i],
+             &comp_id };
+                ret =
+                    CHECK_CU(cu->
+                             cuLaunchKernel(convert_funcs[out->color_range],
+                                            DIV_UP(width, BLOCKX),
+                                            DIV_UP(height, BLOCKY), 1,
+                                            BLOCKX, BLOCKY, 1, 0,
+                                            s->cu_stream, args, NULL));
+                if (ret < 0)
+                    goto fail;
+            } else {
+                ret = av_hwframe_transfer_data(out, in, 0);
+                if (ret < 0)
+                    goto fail;
+            }
         }
     }
 
+  fail:
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return ret;
 }
 
-static int cudacolorspace_conv(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
+static int cudacolorspace_conv(AVFilterContext * ctx, AVFrame * out,
+                               AVFrame * in)
 {
-    CUDAColorspaceContext* s = ctx->priv;
-    AVFilterLink* outlink = ctx->outputs[0];
-    AVFrame* src = in;
+    CUDAColorspaceContext *s = ctx->priv;
+    AVFilterLink *outlink = ctx->outputs[0];
+    AVFrame *src = in;
     int ret;
 
     ret = conv_cuda_convert(ctx, s->own_frame, src);
@@ -341,19 +715,209 @@ static int cudacolorspace_conv(AVFilterContext* ctx, AVFrame* out, AVFrame* in)
     if (ret < 0)
         return ret;
 
+    // Set output frame properties AFTER av_frame_copy_props to avoid overwriting
+    out->color_range =
+        s->range != AVCOL_RANGE_UNSPECIFIED ? s->range : in->color_range;
+    out->colorspace = s->out_csp;
+    out->color_primaries = s->out_prm;
+    out->color_trc = s->out_trc;
+
     return 0;
 }
 
-static int cudacolorspace_filter_frame(AVFilterLink* link, AVFrame* in)
-{
-    AVFilterContext* ctx = link->dst;
-    CUDAColorspaceContext* s = ctx->priv;
-    AVFilterLink* outlink = ctx->outputs[0];
-    CudaFunctions* cu = s->hwctx->internal->cuda_dl;
 
-    AVFrame* out = NULL;
+static int cudacolorspace_activate(AVFilterContext * ctx)
+{
+    AVFilterLink *inlink = ctx->inputs[0];
+    AVFilterLink *outlink = ctx->outputs[0];
+    CUDAColorspaceContext *s = ctx->priv;
+    AVFrame *in = NULL;
+    int ret, status;
+    int64_t pts;
+
+    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        // Try to receive completed frames first to avoid memory buildup
+        AVFrame *out = NULL;
+        ret = ff_cuda_async_queue_receive(&s->async_queue, &out);
+        if (ret == 0 && out) {
+            av_reduce(&out->sample_aspect_ratio.num,
+                      &out->sample_aspect_ratio.den,
+                      (int64_t) out->sample_aspect_ratio.num * outlink->h *
+                      inlink->w,
+                      (int64_t) out->sample_aspect_ratio.den * outlink->w *
+                      inlink->h, INT_MAX);
+            return ff_filter_frame(outlink, out);
+        } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
+            return ret;
+        }
+
+        // Only submit new frames if there's space and no completed frames ready
+        if (!ff_cuda_async_queue_is_full(&s->async_queue)) {
+            ret = ff_inlink_consume_frame(inlink, &in);
+            if (ret < 0) {
+                if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
+                    // No input available, but we might have frames in queue
+                    return AVERROR(EAGAIN);
+                }
+                return ret;
+            }
+
+            if (in) {
+                ret = ff_cuda_async_queue_submit(&s->async_queue, in);
+                av_frame_free(&in);
+                if (ret < 0) {
+                    return ret;
+                }
+                av_log(ctx, AV_LOG_DEBUG,
+                       "Submitted frame to async queue\n");
+            }
+        }
+    } else {
+        // Synchronous processing
+        ret = ff_inlink_consume_frame(inlink, &in);
+        if (ret < 0)
+            return ret;
+
+        if (in) {
+            ret = cudacolorspace_filter_frame(inlink, in);
+            if (ret < 0)
+                return ret;
+        }
+    }
+
+    if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
+        if (s->async_depth > 1 || s->async_streams > 1) {
+            // Flush all remaining async frames
+            while (!ff_cuda_async_queue_is_empty(&s->async_queue)) {
+                AVFrame *out = NULL;
+                ret = ff_cuda_async_queue_receive(&s->async_queue, &out);
+                if (ret == 0 && out) {
+                    av_reduce(&out->sample_aspect_ratio.num,
+                              &out->sample_aspect_ratio.den,
+                              (int64_t) out->sample_aspect_ratio.num *
+                              outlink->h * inlink->w,
+                              (int64_t) out->sample_aspect_ratio.den *
+                              outlink->w * inlink->h, INT_MAX);
+                    ret = ff_filter_frame(outlink, out);
+                    if (ret < 0)
+                        return ret;
+                } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                    av_log(ctx, AV_LOG_WARNING,
+                           "Error receiving async frame during flush: %d\n",
+                           ret);
+                    break;
+                }
+            }
+        }
+        ff_outlink_set_status(outlink, status, pts);
+        return 0;
+    }
+
+    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+
+    return FFERROR_NOT_READY;
+}
+
+static int process_frame_async(void *filter_ctx, AVFrame * out,
+                               AVFrame * in, CUstream stream)
+{
+    AVFilterContext *ctx = (AVFilterContext *) filter_ctx;
+    CUDAColorspaceContext *s = ctx->priv;
+    CUstream old_stream = s->cu_stream;
+    int ret;
+
+    // Don't pre-allocate hardware buffer here - let cudacolorspace_conv handle it
+    // The previous code had a memory leak by allocating here then overwriting in conv
+    
+    // Set the stream and call the conv function (conv manages its own context)
+    s->cu_stream = stream;
+    ret = cudacolorspace_conv(ctx, out, in);
+    s->cu_stream = old_stream;
+
+    if (ret >= 0) {
+        ret = av_frame_copy_props(out, in);
+        if (ret >= 0) {
+            // Set output frame properties AFTER av_frame_copy_props to avoid overwriting
+            out->color_range =
+                s->range != AVCOL_RANGE_UNSPECIFIED ? s->range : in->color_range;
+            out->colorspace = s->out_csp;
+            out->color_primaries = s->out_prm;
+            out->color_trc = s->out_trc;
+        }
+    }
+
+    return ret;
+}
+
+static int cudacolorspace_filter_frame(AVFilterLink * link, AVFrame * in)
+{
+    AVFilterContext *ctx = link->dst;
+    CUDAColorspaceContext *s = ctx->priv;
+    AVFilterLink *outlink = ctx->outputs[0];
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
+
+    AVFrame *out = NULL;
     CUcontext dummy;
     int ret = 0;
+
+    if (s->async_depth > 1 || s->async_streams > 1) {
+        ret = ff_cuda_async_queue_submit(&s->async_queue, in);
+        if (ret == AVERROR(EAGAIN)) {
+            AVFrame *completed_frame = NULL;
+            ret =
+                ff_cuda_async_queue_receive(&s->async_queue,
+                                            &completed_frame);
+            if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                av_frame_free(&in);
+                return ret;
+            }
+            if (completed_frame) {
+                av_reduce(&completed_frame->sample_aspect_ratio.num,
+                          &completed_frame->sample_aspect_ratio.den,
+                          (int64_t) in->sample_aspect_ratio.num *
+                          outlink->h * link->w,
+                          (int64_t) in->sample_aspect_ratio.den *
+                          outlink->w * link->h, INT_MAX);
+                ret = ff_filter_frame(outlink, completed_frame);
+                if (ret < 0) {
+                    av_frame_free(&in);
+                    return ret;
+                }
+            }
+            ret = ff_cuda_async_queue_submit(&s->async_queue, in);
+        }
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
+
+        while (ff_inlink_queued_frames(link) == 0) {
+            AVFrame *completed_frame = NULL;
+            ret =
+                ff_cuda_async_queue_receive(&s->async_queue,
+                                            &completed_frame);
+            if (ret == AVERROR(EAGAIN)) {
+                break;
+            } else if (ret < 0) {
+                return ret;
+            }
+            if (completed_frame) {
+                av_reduce(&completed_frame->sample_aspect_ratio.num,
+                          &completed_frame->sample_aspect_ratio.den,
+                          (int64_t) in->sample_aspect_ratio.num *
+                          outlink->h * link->w,
+                          (int64_t) in->sample_aspect_ratio.den *
+                          outlink->w * link->h, INT_MAX);
+                ret = ff_filter_frame(outlink, completed_frame);
+                if (ret < 0)
+                    return ret;
+            }
+        }
+
+        return 0;
+    }
 
     out = av_frame_alloc();
     if (!out) {
@@ -372,13 +936,13 @@ static int cudacolorspace_filter_frame(AVFilterLink* link, AVFrame* in)
         goto fail;
 
     av_reduce(&out->sample_aspect_ratio.num, &out->sample_aspect_ratio.den,
-              (int64_t)in->sample_aspect_ratio.num * outlink->h * link->w,
-              (int64_t)in->sample_aspect_ratio.den * outlink->w * link->h,
+              (int64_t) in->sample_aspect_ratio.num * outlink->h * link->w,
+              (int64_t) in->sample_aspect_ratio.den * outlink->w * link->h,
               INT_MAX);
 
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
-fail:
+  fail:
     av_frame_free(&in);
     av_frame_free(&out);
     return ret;
@@ -387,12 +951,70 @@ fail:
 #define OFFSET(x) offsetof(CUDAColorspaceContext, x)
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
 static const AVOption options[] = {
-    {"range", "Output video range", OFFSET(range), AV_OPT_TYPE_INT, { .i64 = AVCOL_RANGE_UNSPECIFIED }, AVCOL_RANGE_UNSPECIFIED, AVCOL_RANGE_NB - 1, FLAGS, .unit = "range"},
-        {"tv",   "Limited range", 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, .unit = "range"},
-        {"mpeg", "Limited range", 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, .unit = "range"},
-        {"pc",   "Full range",    0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, .unit = "range"},
-        {"jpeg", "Full range",    0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, .unit = "range"},
-    {NULL},
+    { "range", "Output video range", OFFSET(range), AV_OPT_TYPE_INT,
+     {.i64 =
+      AVCOL_RANGE_UNSPECIFIED}, AVCOL_RANGE_UNSPECIFIED,
+     AVCOL_RANGE_NB - 1, FLAGS,.unit = "range" },
+    { "tv", "Limited range", 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_RANGE_MPEG}, 0, 0, FLAGS,.unit = "range" },
+    { "mpeg", "Limited range", 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_RANGE_MPEG}, 0, 0, FLAGS,.unit = "range" },
+    { "pc", "Full range", 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},
+     0, 0, FLAGS,.unit = "range" },
+    { "jpeg", "Full range", 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_RANGE_JPEG}, 0, 0, FLAGS,.unit = "range" },
+
+    { "space", "Output colorspace", OFFSET(user_csp), AV_OPT_TYPE_INT,
+     {.i64 =
+      AVCOL_SPC_UNSPECIFIED}, AVCOL_SPC_RGB, AVCOL_SPC_NB - 1,
+     FLAGS,.unit = "csp" },
+    { "bt709", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_SPC_BT709}, 0, 0,
+     FLAGS,.unit = "csp" },
+    { "bt470bg", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_SPC_BT470BG}, 0,
+     0, FLAGS,.unit = "csp" },
+    { "smpte170m", NULL, 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_SPC_SMPTE170M}, 0, 0, FLAGS,.unit = "csp" },
+    { "bt2020nc", NULL, 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_SPC_BT2020_NCL}, 0, 0, FLAGS,.unit = "csp" },
+    { "bt2020ncl", NULL, 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_SPC_BT2020_NCL}, 0, 0, FLAGS,.unit = "csp" },
+    { "bt601", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_SPC_SMPTE170M}, 0,
+     0, FLAGS,.unit = "csp" },
+
+    { "primaries", "Output color primaries", OFFSET(user_prm),
+     AV_OPT_TYPE_INT, {.i64 =
+                       AVCOL_PRI_UNSPECIFIED}, AVCOL_PRI_RESERVED0,
+     AVCOL_PRI_NB - 1, FLAGS,.unit = "prm" },
+    { "bt709", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_PRI_BT709}, 0, 0,
+     FLAGS,.unit = "prm" },
+    { "bt470bg", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_PRI_BT470BG}, 0,
+     0, FLAGS,.unit = "prm" },
+    { "smpte170m", NULL, 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_PRI_SMPTE170M}, 0, 0, FLAGS,.unit = "prm" },
+    { "bt2020", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_PRI_BT2020}, 0,
+     0, FLAGS,.unit = "prm" },
+
+    { "trc", "Output transfer characteristics", OFFSET(user_trc),
+     AV_OPT_TYPE_INT, {.i64 =
+                       AVCOL_TRC_UNSPECIFIED}, AVCOL_TRC_RESERVED0,
+     AVCOL_TRC_NB - 1, FLAGS,.unit = "trc" },
+    { "bt709", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_BT709}, 0, 0,
+     FLAGS,.unit = "trc" },
+    { "bt2020-10", NULL, 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_TRC_BT2020_10}, 0, 0, FLAGS,.unit = "trc" },
+    { "smpte170m", NULL, 0, AV_OPT_TYPE_CONST,
+     {.i64 = AVCOL_TRC_SMPTE170M}, 0, 0, FLAGS,.unit = "trc" },
+
+    { "async_depth", "Frame queue depth for async processing",
+     OFFSET(async_depth), AV_OPT_TYPE_INT, {.i64 =
+                                            1}, 1, MAX_FRAME_QUEUE_SIZE,
+     FLAGS },
+    { "async_streams", "Number of CUDA streams for async processing",
+     OFFSET(async_streams), AV_OPT_TYPE_INT, {.i64 =
+                                              1}, 1, MAX_CUDA_STREAMS,
+     FLAGS },
+
+    { NULL },
 };
 
 static const AVClass cudacolorspace_class = {
@@ -404,28 +1026,29 @@ static const AVClass cudacolorspace_class = {
 
 static const AVFilterPad cudacolorspace_inputs[] = {
     {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = cudacolorspace_filter_frame,
-    },
+     .name = "default",
+     .type = AVMEDIA_TYPE_VIDEO,
+      },
 };
 
 static const AVFilterPad cudacolorspace_outputs[] = {
     {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-        .config_props = cudacolorspace_config_props,
-    },
+     .name = "default",
+     .type = AVMEDIA_TYPE_VIDEO,
+     .config_props = cudacolorspace_config_props,
+      },
 };
 
 const FFFilter ff_vf_colorspace_cuda = {
-    .p.name        = "colorspace_cuda",
-    .p.description = NULL_IF_CONFIG_SMALL("CUDA accelerated video color converter"),
+    .p.name = "colorspace_cuda",
+    .p.description =
+        NULL_IF_CONFIG_SMALL("CUDA accelerated video color converter"),
 
-    .p.priv_class  = &cudacolorspace_class,
+    .p.priv_class = &cudacolorspace_class,
 
     .init = cudacolorspace_init,
     .uninit = cudacolorspace_uninit,
+    .activate = cudacolorspace_activate,
 
     .priv_size = sizeof(CUDAColorspaceContext),
 
