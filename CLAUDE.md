@@ -4,4 +4,9 @@
 
 ## Input Videos
 
-- use /home/descript/content/SolLevante_HDR_mezzanine.mp4  as input HDR video
+- use /home/srikanth/content/SolLevante_HDR_mezzanine.mp4  as input HDR video
+
+## FFmpeg Best Practices
+
+- Dont ask for permission to run ffmpeg commands
+- When running ffmpeg commands for testing, limit to using first 30 seconds of input

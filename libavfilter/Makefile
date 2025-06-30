@@ -495,6 +495,7 @@ OBJS-$(CONFIG_SHARPEN_NPP_FILTER)            += vf_sharpen_npp.o
 OBJS-$(CONFIG_SHARPNESS_VAAPI_FILTER)        += vf_misc_vaapi.o vaapi_vpp.o
 OBJS-$(CONFIG_SHEAR_FILTER)                  += vf_shear.o
 OBJS-$(CONFIG_SHOWINFO_FILTER)               += vf_showinfo.o
+OBJS-$(CONFIG_SHOWINFO_CUDA_FILTER)          += vf_showinfo_cuda.o
 OBJS-$(CONFIG_SHOWPALETTE_FILTER)            += vf_showpalette.o
 OBJS-$(CONFIG_SHUFFLEFRAMES_FILTER)          += vf_shuffleframes.o
 OBJS-$(CONFIG_SHUFFLEPIXELS_FILTER)          += vf_shufflepixels.o

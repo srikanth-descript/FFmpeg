@@ -31,11 +31,28 @@ extern "C" {
 #define JPEG_LUMA_MAX   (255)
 #define JPEG_CHROMA_MAX (255)
 
+// 16-bit constants (10-bit values shifted to 16-bit)
+#define MPEG_LUMA_MIN_16   (16 << 6)
+#define MPEG_CHROMA_MIN_16 (16 << 6)
+#define MPEG_LUMA_MAX_16   (235 << 6)
+#define MPEG_CHROMA_MAX_16 (240 << 6)
+
+#define JPEG_LUMA_MIN_16   (0)
+#define JPEG_CHROMA_MIN_16 (1 << 6)
+#define JPEG_LUMA_MAX_16   (65535)
+#define JPEG_CHROMA_MAX_16 (65535)
+
 __device__ int mpeg_min[] = {MPEG_LUMA_MIN, MPEG_CHROMA_MIN};
 __device__ int mpeg_max[] = {MPEG_LUMA_MAX, MPEG_CHROMA_MAX};
 
 __device__ int jpeg_min[] = {JPEG_LUMA_MIN, JPEG_CHROMA_MIN};
 __device__ int jpeg_max[] = {JPEG_LUMA_MAX, JPEG_CHROMA_MAX};
+
+__device__ int mpeg_min_16[] = {MPEG_LUMA_MIN_16, MPEG_CHROMA_MIN_16};
+__device__ int mpeg_max_16[] = {MPEG_LUMA_MAX_16, MPEG_CHROMA_MAX_16};
+
+__device__ int jpeg_min_16[] = {JPEG_LUMA_MIN_16, JPEG_CHROMA_MIN_16};
+__device__ int jpeg_max_16[] = {JPEG_LUMA_MAX_16, JPEG_CHROMA_MAX_16};
 
 __device__ int clamp(int val, int min, int max)
 {
@@ -91,6 +108,45 @@ __global__ void to_mpeg_cuda(const unsigned char* src, unsigned char* dst,
     dst[x + y * pitch] = static_cast<unsigned char>(dst_);
 }
 
+__global__ void to_jpeg_cuda_16(const unsigned short* src, unsigned short* dst,
+                                int pitch, int comp_id)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int pitch_pixels = pitch / 2;  // Convert byte pitch to pixel pitch
+    int src_, dst_;
+
+    // 10-bit input in 16-bit container -> scale for processing
+    src_ = static_cast<int>(src[x + y * pitch_pixels]);
+
+    // Scale to full 16-bit range for conversion
+    dst_ = comp_id ? (src_ * 65535 - 64 * 65535) / (1023 - 64)     // chroma
+                   : (src_ * 65535 - 64 * 65535) / (940 - 64);    // luma
+
+    dst[x + y * pitch_pixels] = static_cast<unsigned short>(clamp(dst_, jpeg_min_16[comp_id], jpeg_max_16[comp_id]));
+}
+
+__global__ void to_mpeg_cuda_16(const unsigned short* src, unsigned short* dst,
+                                int pitch, int comp_id)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int pitch_pixels = pitch / 2;  // Convert byte pitch to pixel pitch
+    int src_, dst_;
+
+    // 10-bit input in 16-bit container -> scale to limited range
+    src_ = static_cast<int>(src[x + y * pitch_pixels]);
+
+    // Scale from full range to limited range
+    dst_ = comp_id ? (src_ * (240 - 16) / 65535) + 16     // chroma
+                   : (src_ * (235 - 16) / 65535) + 16;    // luma
+
+    // Scale to 16-bit container (10-bit values)
+    dst_ = dst_ << 6;
+
+    dst[x + y * pitch_pixels] = static_cast<unsigned short>(clamp(dst_, mpeg_min_16[comp_id], mpeg_max_16[comp_id]));
+}
+
 __global__ void colorspace_convert_cuda(const unsigned char* src, unsigned char* dst,
                                        int src_pitch, int dst_pitch, int width, int height, int plane_id,
                                        float m00, float m01, float m02,
@@ -120,6 +176,43 @@ __global__ void colorspace_convert_cuda(const unsigned char* src, unsigned char*
         // For V plane conversion, we apply the matrix considering zero U input and V
         float dst_v = m20 * 128.0f + m21 * 128.0f + m22 * (src_v + 128.0f);
         dst[x + y * dst_pitch] = (unsigned char)clamp((int)(dst_v + 0.5f), 0, 255);
+    }
+}
+
+__global__ void colorspace_convert_cuda_16(const unsigned short* src, unsigned short* dst,
+                                          int src_pitch, int dst_pitch, int width, int height, int plane_id,
+                                          float m00, float m01, float m02,
+                                          float m10, float m11, float m12,
+                                          float m20, float m21, float m22)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int src_pitch_pixels = src_pitch / 2;  // Convert byte pitch to pixel pitch
+    int dst_pitch_pixels = dst_pitch / 2;  // Convert byte pitch to pixel pitch
+
+    if (x >= width || y >= height)
+        return;
+
+    // For 10-bit in 16-bit container, chroma center is at 512 << 6 = 32768
+    const float chroma_center = 32768.0f;
+
+    if (plane_id == 0) {
+        // Luma plane (Y) - apply only first row of matrix
+        float src_y = (float)src[x + y * src_pitch_pixels];
+        float dst_y = m00 * src_y + m01 * chroma_center + m02 * chroma_center;
+        dst[x + y * dst_pitch_pixels] = (unsigned short)clamp((int)(dst_y + 0.5f), 0, 65535);
+    } else if (plane_id == 1) {
+        // U plane - apply second row of matrix, but we only have U component
+        float src_u = (float)src[x + y * src_pitch_pixels] - chroma_center;
+        // For U plane conversion, we apply the matrix considering U input and zero V
+        float dst_u = m10 * chroma_center + m11 * (src_u + chroma_center) + m12 * chroma_center;
+        dst[x + y * dst_pitch_pixels] = (unsigned short)clamp((int)(dst_u + 0.5f), 0, 65535);
+    } else {
+        // V plane - apply third row of matrix, but we only have V component  
+        float src_v = (float)src[x + y * src_pitch_pixels] - chroma_center;
+        // For V plane conversion, we apply the matrix considering zero U input and V
+        float dst_v = m20 * chroma_center + m21 * chroma_center + m22 * (src_v + chroma_center);
+        dst[x + y * dst_pitch_pixels] = (unsigned short)clamp((int)(dst_v + 0.5f), 0, 65535);
     }
 }
 

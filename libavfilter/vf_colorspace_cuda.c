@@ -41,6 +41,7 @@ static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_NV12,
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_YUV444P,
+    AV_PIX_FMT_P016LE,
 };
 
 #define DIV_UP(a, b) (((a) + (b)-1) / (b))
@@ -62,6 +63,8 @@ typedef struct CUDAColorspaceContext {
     CUmodule cu_module;
     CUfunction cu_convert[AVCOL_RANGE_NB];
     CUfunction cu_convert_colorspace;
+    CUfunction cu_convert_16[AVCOL_RANGE_NB];
+    CUfunction cu_convert_colorspace_16;
 
 
     enum AVPixelFormat pix_fmt;
@@ -211,6 +214,11 @@ static int format_is_supported(enum AVPixelFormat fmt)
     return 0;
 }
 
+static int format_is_16bit(enum AVPixelFormat fmt)
+{
+    return fmt == AV_PIX_FMT_P016LE;
+}
+
 static av_cold int init_processing_chain(AVFilterContext * ctx, int width,
                                          int height)
 {
@@ -311,6 +319,28 @@ static av_cold int cudacolorspace_load_functions(AVFilterContext * ctx)
                  cuModuleGetFunction(&s->cu_convert_colorspace,
                                      s->cu_module,
                                      "colorspace_convert_cuda"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_16[AVCOL_RANGE_MPEG],
+                                     s->cu_module, "to_mpeg_cuda_16"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_16[AVCOL_RANGE_JPEG],
+                                     s->cu_module, "to_jpeg_cuda_16"));
+    if (ret < 0)
+        goto fail;
+
+    ret =
+        CHECK_CU(cu->
+                 cuModuleGetFunction(&s->cu_convert_colorspace_16,
+                                     s->cu_module,
+                                     "colorspace_convert_cuda_16"));
     if (ret < 0)
         goto fail;
 
@@ -458,6 +488,9 @@ static int conv_cuda_convert(AVFilterContext * ctx, AVFrame * out,
             case AV_PIX_FMT_NV12:
                 height = (i > 0) ? in->height / 2 : in->height;
                 break;
+            case AV_PIX_FMT_P016LE:
+                height = (i > 0) ? in->height / 2 : in->height;
+                break;
             default:
                 av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
                        av_get_pix_fmt_name(s->pix_fmt));
@@ -475,9 +508,11 @@ static int conv_cuda_convert(AVFilterContext * ctx, AVFrame * out,
                 &s->yuv2yuv_matrix[2][0], &s->yuv2yuv_matrix[2][1],
                     &s->yuv2yuv_matrix[2][2]
             };
+            CUfunction kernel = format_is_16bit(s->pix_fmt) ? 
+                                s->cu_convert_colorspace_16 : s->cu_convert_colorspace;
             ret =
                 CHECK_CU(cu->
-                         cuLaunchKernel(s->cu_convert_colorspace,
+                         cuLaunchKernel(kernel,
                                         DIV_UP(width, BLOCKX),
                                         DIV_UP(height, BLOCKY), 1, BLOCKX,
                                         BLOCKY, 1, 0, s->cu_stream, args,
@@ -499,6 +534,9 @@ static int conv_cuda_convert(AVFilterContext * ctx, AVFrame * out,
             case AV_PIX_FMT_NV12:
                 height = comp_id ? in->height / 2 : in->height;
                 break;
+            case AV_PIX_FMT_P016LE:
+                height = comp_id ? in->height / 2 : in->height;
+                break;
             default:
                 av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n",
                        av_get_pix_fmt_name(s->pix_fmt));
@@ -507,7 +545,9 @@ static int conv_cuda_convert(AVFilterContext * ctx, AVFrame * out,
 
             if (s->range != AVCOL_RANGE_UNSPECIFIED
                 && in->color_range != out->color_range) {
-                if (!s->cu_convert[out->color_range]) {
+                CUfunction *convert_funcs = format_is_16bit(s->pix_fmt) ? 
+                                           s->cu_convert_16 : s->cu_convert;
+                if (!convert_funcs[out->color_range]) {
                     av_log(ctx, AV_LOG_ERROR, "Unsupported color range\n");
                     return AVERROR(EINVAL);
                 }
@@ -517,8 +557,7 @@ static int conv_cuda_convert(AVFilterContext * ctx, AVFrame * out,
              &comp_id };
                 ret =
                     CHECK_CU(cu->
-                             cuLaunchKernel(s->
-                                            cu_convert[out->color_range],
+                             cuLaunchKernel(convert_funcs[out->color_range],
                                             DIV_UP(width, BLOCKX),
                                             DIV_UP(height, BLOCKY), 1,
                                             BLOCKX, BLOCKY, 1, 0,

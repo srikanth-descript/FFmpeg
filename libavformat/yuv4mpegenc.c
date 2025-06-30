@@ -281,7 +281,9 @@ static int yuv4_init(AVFormatContext *s)
                "yuva444p, "
                "gray9, gray10, gray12 "
                "and gray16 pixel formats. "
-               "Use -pix_fmt to select one.\n");
+               "Specified pixel format is '%s'. "
+               "Use -pix_fmt to select one.\n",
+               av_get_pix_fmt_name(s->streams[0]->codecpar->format));
         return AVERROR(EIO);
     }
 

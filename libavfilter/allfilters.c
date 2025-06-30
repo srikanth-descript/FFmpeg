@@ -464,6 +464,7 @@ extern const FFFilter ff_vf_sharpen_npp;
 extern const FFFilter ff_vf_sharpness_vaapi;
 extern const FFFilter ff_vf_shear;
 extern const FFFilter ff_vf_showinfo;
+extern const FFFilter ff_vf_showinfo_cuda;
 extern const FFFilter ff_vf_showpalette;
 extern const FFFilter ff_vf_shuffleframes;
 extern const FFFilter ff_vf_shufflepixels;
