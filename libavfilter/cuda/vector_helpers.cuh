@@ -23,10 +23,30 @@
 #ifndef AVFILTER_CUDA_VECTORHELPERS_H
 #define AVFILTER_CUDA_VECTORHELPERS_H
 
-#include <cuda_runtime.h>
-
 typedef unsigned char uchar;
 typedef unsigned short ushort;
+
+// Define float3 and int3 types since they may not be available
+struct float3 {
+    float x, y, z;
+    __device__ float3() {}
+    __device__ float3(float x_, float y_, float z_) : x(x_), y(y_), z(z_) {}
+};
+
+struct int3 {
+    int x, y, z;
+    __device__ int3() {}
+    __device__ int3(int x_, int y_, int z_) : x(x_), y(y_), z(z_) {}
+};
+
+// Helper functions to create float3 and int3
+__device__ inline float3 make_float3(float x, float y, float z) {
+    return float3(x, y, z);
+}
+
+__device__ inline int3 make_int3(int x, int y, int z) {
+    return int3(x, y, z);
+}
 
 template<typename T> struct vector_helper { };
 template<> struct vector_helper<uchar>   { typedef float  ftype; typedef int  itype; };
