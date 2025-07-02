@@ -23,6 +23,8 @@
 #ifndef AVFILTER_CUDA_VECTORHELPERS_H
 #define AVFILTER_CUDA_VECTORHELPERS_H
 
+#include <vector_types.h>
+
 typedef unsigned char uchar;
 typedef unsigned short ushort;
 
@@ -35,7 +37,9 @@ template<> struct vector_helper<ushort2> { typedef float2 ftype; typedef int2 it
 template<> struct vector_helper<ushort4> { typedef float4 ftype; typedef int4 itype; };
 template<> struct vector_helper<int>     { typedef float  ftype; typedef int  itype; };
 template<> struct vector_helper<int2>    { typedef float2 ftype; typedef int2 itype; };
+template<> struct vector_helper<int3>    { typedef float3 ftype; typedef int3 itype; };
 template<> struct vector_helper<int4>    { typedef float4 ftype; typedef int4 itype; };
+template<> struct vector_helper<float3>  { typedef float3 ftype; typedef int3 itype; };
 
 #define floatT typename vector_helper<T>::ftype
 #define intT typename vector_helper<T>::itype
@@ -77,6 +81,20 @@ OPERATORS4(uchar4)
 OPERATORS4(ushort4)
 OPERATORS4(float4)
 
+#define OPERATORS3(T) \
+    template<typename V> inline __device__ T operator+(const T &a, const V &b) { return make_ ## T (a.x + b.x, a.y + b.y, a.z + b.z); } \
+    template<typename V> inline __device__ T operator-(const T &a, const V &b) { return make_ ## T (a.x - b.x, a.y - b.y, a.z - b.z); } \
+    template<typename V> inline __device__ T operator*(const T &a, V b) { return make_ ## T (a.x * b, a.y * b, a.z * b); } \
+    template<typename V> inline __device__ T operator/(const T &a, V b) { return make_ ## T (a.x / b, a.y / b, a.z / b); } \
+    template<typename V> inline __device__ T &operator+=(T &a, const V &b) { a.x += b.x; a.y += b.y; a.z += b.z; return a; } \
+    template<typename V> inline __device__ void vec_set(T &a, const V &b) { a.x = b.x; a.y = b.y; a.z = b.z; } \
+    template<typename V> inline __device__ void vec_set_scalar(T &a, V b) { a.x = b; a.y = b; a.z = b; } \
+    template<> inline __device__ float3 to_floatN<T, float3>(const T &a) { return make_float3(a.x, a.y, a.z); } \
+    template<> inline __device__ T from_floatN<T, float3>(const float3 &a) { return make_ ## T(a.x, a.y, a.z); }
+
+OPERATORS3(int3)
+OPERATORS3(float3)
+
 template<typename V> inline __device__ void vec_set(int &a, V b) { a = b; }
 template<typename V> inline __device__ void vec_set(float &a, V b) { a = b; }
 template<typename V> inline __device__ void vec_set(uchar &a, V b) { a = b; }
@@ -96,6 +114,15 @@ inline __device__ float2 lerp_scalar<float2>(float2 v0, float2 v1, float t) {
     return make_float2(
         lerp_scalar(v0.x, v1.x, t),
         lerp_scalar(v0.y, v1.y, t)
+    );
+}
+
+template<>
+inline __device__ float3 lerp_scalar<float3>(float3 v0, float3 v1, float t) {
+    return make_float3(
+        lerp_scalar(v0.x, v1.x, t),
+        lerp_scalar(v0.y, v1.y, t),
+        lerp_scalar(v0.z, v1.z, t)
     );
 }
 
