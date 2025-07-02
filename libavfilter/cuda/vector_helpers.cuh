@@ -23,7 +23,7 @@
 #ifndef AVFILTER_CUDA_VECTORHELPERS_H
 #define AVFILTER_CUDA_VECTORHELPERS_H
 
-#include <vector_types.h>
+#include <cuda_runtime.h>
 
 typedef unsigned char uchar;
 typedef unsigned short ushort;
