@@ -4696,7 +4696,7 @@ if enabled cuda_nvcc; then
     nvccflags_default="-gencode arch=compute_30,code=sm_30 -O2"
 else
     nvcc_default="clang"
-    nvccflags_default="--cuda-gpu-arch=sm_30 -O2"
+    nvccflags_default="--cuda-gpu-arch=sm_50 -O2"
     NVCC_C=""
 fi
 
