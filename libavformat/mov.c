@@ -55,6 +55,7 @@
 #include "libavcodec/hevc/hevc.h"
 #include "libavcodec/mpegaudiodecheader.h"
 #include "libavcodec/mlp_parse.h"
+
 #include "avformat.h"
 #include "internal.h"
 #include "avio_internal.h"
@@ -10319,6 +10320,43 @@ static int mov_parse_tiles(AVFormatContext *s)
             return err;
 
 
+        // Add tile positioning metadata to each stream
+        for (int j = 0; j < tile_grid->nb_tiles; j++) {
+            if (j < stg->nb_streams) {
+                AVStream *tile_st = stg->streams[j];
+                char meta_buf[32];
+                
+                // Add tile grid information as stream metadata
+                snprintf(meta_buf, sizeof(meta_buf), "%d", grid->item->item_id);
+                av_dict_set(&tile_st->metadata, "heif_tile_grid_id", meta_buf, 0);
+                
+                snprintf(meta_buf, sizeof(meta_buf), "%d", j);
+                av_dict_set(&tile_st->metadata, "heif_tile_index", meta_buf, 0);
+                
+                snprintf(meta_buf, sizeof(meta_buf), "%d", tile_grid->offsets[j].horizontal);
+                av_dict_set(&tile_st->metadata, "heif_tile_x", meta_buf, 0);
+                
+                snprintf(meta_buf, sizeof(meta_buf), "%d", tile_grid->offsets[j].vertical);
+                av_dict_set(&tile_st->metadata, "heif_tile_y", meta_buf, 0);
+                
+                snprintf(meta_buf, sizeof(meta_buf), "%dx%d", tile_grid->coded_width, tile_grid->coded_height);
+                av_dict_set(&tile_st->metadata, "heif_canvas_size", meta_buf, 0);
+                
+                snprintf(meta_buf, sizeof(meta_buf), "%dx%d", tile_grid->width, tile_grid->height);
+                av_dict_set(&tile_st->metadata, "heif_presentation_size", meta_buf, 0);
+                
+                snprintf(meta_buf, sizeof(meta_buf), "%d,%d", tile_grid->horizontal_offset, tile_grid->vertical_offset);
+                av_dict_set(&tile_st->metadata, "heif_crop_offset", meta_buf, 0);
+                
+                snprintf(meta_buf, sizeof(meta_buf), "%d", tile_grid->nb_tiles);
+                av_dict_set(&tile_st->metadata, "heif_total_tiles", meta_buf, 0);
+                
+                av_log(s, AV_LOG_DEBUG, "Added tile metadata: stream=%d, grid_id=%d, pos=(%d,%d)\n",
+                       tile_st->index, grid->item->item_id, 
+                       tile_grid->offsets[j].horizontal, tile_grid->offsets[j].vertical);
+            }
+        }
+        
         if (grid->item->name)
             av_dict_set(&stg->metadata, "title", grid->item->name, 0);
         if (grid->item->item_id == mov->primary_item_id)
@@ -10728,6 +10766,7 @@ static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
         AVStream *avst = s->streams[i];
         FFStream *const avsti = ffstream(avst);
         MOVStreamContext *msc = avst->priv_data;
+        
         if (msc->pb && msc->current_sample < avsti->nb_index_entries) {
             AVIndexEntry *current_sample = &avsti->index_entries[msc->current_sample];
             int64_t dts = av_rescale(current_sample->timestamp, AV_TIME_BASE, msc->time_scale);
@@ -10924,6 +10963,28 @@ static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *s
     }
     pkt->flags |= sample->flags & AVINDEX_KEYFRAME ? AV_PKT_FLAG_KEY : 0;
     pkt->pos = sample->pos;
+    
+    // Add HEIF tile metadata to packet as side data
+    if (st->metadata) {
+        AVDictionaryEntry *entry = NULL;
+        AVDictionary *metadata_dict = NULL;
+        
+        // Copy all HEIF tile metadata entries
+        while ((entry = av_dict_get(st->metadata, "heif_", entry, AV_DICT_IGNORE_SUFFIX))) {
+            av_dict_set(&metadata_dict, entry->key, entry->value, 0);
+        }
+        
+        if (metadata_dict) {
+            uint8_t *metadata_buf;
+            int metadata_size = av_dict_get_string(metadata_dict, &metadata_buf, '=', '\n');
+            if (metadata_size > 0) {
+                av_log(s, AV_LOG_DEBUG, "Adding HEIF metadata to packet: stream=%d, size=%d\n", 
+                       st->index, metadata_size);
+                av_packet_add_side_data(pkt, AV_PKT_DATA_STRINGS_METADATA, metadata_buf, metadata_size);
+            }
+            av_dict_free(&metadata_dict);
+        }
+    }
 
     /* Multiple stsd handling. */
     if (sc->stsc_data) {
@@ -10946,6 +11007,21 @@ static int mov_finalize_packet(AVFormatContext *s, AVStream *st, AVIndexEntry *s
 
     return 0;
 }
+
+// Helper function to find next sample for a specific stream
+static AVIndexEntry *mov_find_next_sample_for_stream(AVFormatContext *s, AVStream *st)
+{
+    MOVStreamContext *sc = st->priv_data;
+    FFStream *avsti = ffstream(st);
+    
+    if (sc->current_index >= avsti->nb_index_entries)
+        return NULL;
+        
+    return &avsti->index_entries[sc->current_index];
+}
+
+
+
 
 static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
@@ -11002,6 +11078,7 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
         goto retry;
     }
     sc = st->priv_data;
+    
     /* must be done just before reading, to avoid infinite loop on sample */
     current_index = sc->current_index;
     mov_current_sample_inc(sc);

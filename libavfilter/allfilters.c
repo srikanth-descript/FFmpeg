@@ -312,6 +312,7 @@ extern const FFFilter ff_vf_grayworld;
 extern const FFFilter ff_vf_greyedge;
 extern const FFFilter ff_vf_guided;
 extern const FFFilter ff_vf_haldclut;
+extern const FFFilter ff_vf_heif_auto_compositor;
 extern const FFFilter ff_vf_hflip;
 extern const FFFilter ff_vf_hflip_vulkan;
 extern const FFFilter ff_vf_histeq;
