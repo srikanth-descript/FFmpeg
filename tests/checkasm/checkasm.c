@@ -208,7 +208,7 @@ static const struct {
     #if CONFIG_ME_CMP
         { "motion", checkasm_check_motion },
     #endif
-    #if CONFIG_MPEGVIDEOENC
+    #if CONFIG_MPEGVIDEOENCDSP
         { "mpegvideoencdsp", checkasm_check_mpegvideoencdsp },
     #endif
     #if CONFIG_OPUS_DECODER
@@ -260,14 +260,23 @@ static const struct {
     #endif
 #endif
 #if CONFIG_AVFILTER
+    #if CONFIG_SCENE_SAD
+        { "scene_sad", checkasm_check_scene_sad },
+    #endif
     #if CONFIG_AFIR_FILTER
         { "af_afir", checkasm_check_afir },
+    #endif
+    #if CONFIG_BLACKDETECT_FILTER
+        { "vf_blackdetect", checkasm_check_blackdetect },
     #endif
     #if CONFIG_BLEND_FILTER
         { "vf_blend", checkasm_check_blend },
     #endif
     #if CONFIG_BWDIF_FILTER
         { "vf_bwdif", checkasm_check_vf_bwdif },
+    #endif
+    #if CONFIG_COLORDETECT_FILTER
+        { "vf_colordetect", checkasm_check_colordetect },
     #endif
     #if CONFIG_COLORSPACE_FILTER
         { "vf_colorspace", checkasm_check_colorspace },
