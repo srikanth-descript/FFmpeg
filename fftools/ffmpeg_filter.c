@@ -68,6 +68,9 @@ typedef struct FilterGraphPriv {
 
     Scheduler       *sch;
     unsigned         sch_idx;
+    
+    // Metadata for stream group information (e.g., HEIF tiles)
+    AVDictionary    *metadata;
 } FilterGraphPriv;
 
 static FilterGraphPriv *fgp_from_fg(FilterGraph *fg)
@@ -1039,6 +1042,7 @@ void fg_free(FilterGraph **pfg)
 
     av_frame_free(&fgp->frame);
     av_frame_free(&fgp->frame_enc);
+    av_dict_free(&fgp->metadata);
 
     av_freep(pfg);
 }
@@ -1330,6 +1334,63 @@ static int fg_complex_bind_input(FilterGraph *fg, InputFilter *ifilter)
             if (ret < 0) {
                 stream_specifier_uninit(&ss);
                 return ret;
+            }
+        }
+
+        // Extract HEIF metadata for auto-compositor filter when using stream group syntax
+        if ((ss.stream_list == STREAM_LIST_GROUP_IDX || ss.stream_list == STREAM_LIST_GROUP_ID) &&
+            ifilter->graph && strstr(ifilter->graph->graph_desc, "heif_auto_compositor")) {
+            
+            AVStreamGroup *g = NULL;
+            if (ss.stream_list == STREAM_LIST_GROUP_IDX &&
+                ss.list_id >= 0 && ss.list_id < s->nb_stream_groups) {
+                g = s->stream_groups[ss.list_id];
+            } else if (ss.stream_list == STREAM_LIST_GROUP_ID) {
+                for (unsigned i = 0; i < s->nb_stream_groups; i++) {
+                    if (ss.list_id == s->stream_groups[i]->id) {
+                        g = s->stream_groups[i];
+                        break;
+                    }
+                }
+            }
+            
+            if (g && g->type == AV_STREAM_GROUP_PARAMS_TILE_GRID) {
+                AVStreamGroupTileGrid *tile = g->params.tile_grid;
+                
+                av_log(fg, AV_LOG_INFO, "HEIF stream group %d found: %d tiles, canvas %dx%d, presentation %dx%d\n",
+                       ss.list_id, tile->nb_tiles, tile->coded_width, tile->coded_height, tile->width, tile->height);
+                
+                // Store metadata with stream group specific keys for access by the filter
+                FilterGraphPriv *fgp = fgp_from_fg(ifilter->graph);
+                char key_prefix[32];
+                snprintf(key_prefix, sizeof(key_prefix), "heif_g%d", (int)ss.list_id);
+                
+                av_dict_set(&fgp->metadata, av_asprintf("%s_canvas_w", key_prefix), av_asprintf("%d", tile->coded_width), AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+                av_dict_set(&fgp->metadata, av_asprintf("%s_canvas_h", key_prefix), av_asprintf("%d", tile->coded_height), AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+                av_dict_set(&fgp->metadata, av_asprintf("%s_presentation_w", key_prefix), av_asprintf("%d", tile->width), AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+                av_dict_set(&fgp->metadata, av_asprintf("%s_presentation_h", key_prefix), av_asprintf("%d", tile->height), AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+                av_dict_set(&fgp->metadata, av_asprintf("%s_horizontal_offset", key_prefix), av_asprintf("%d", tile->horizontal_offset), AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+                av_dict_set(&fgp->metadata, av_asprintf("%s_vertical_offset", key_prefix), av_asprintf("%d", tile->vertical_offset), AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+                av_dict_set(&fgp->metadata, av_asprintf("%s_total_tiles", key_prefix), av_asprintf("%d", tile->nb_tiles), AV_DICT_DONT_STRDUP_KEY | AV_DICT_DONT_STRDUP_VAL);
+                
+                // Store the stream group index for the filter to identify which group it's using
+                av_dict_set(&fgp->metadata, "heif_active_group", av_asprintf("%d", (int)ss.list_id), AV_DICT_DONT_STRDUP_VAL);
+                
+                // Store tile positioning information using the offsets array
+                for (unsigned t = 0; t < tile->nb_tiles && t < g->nb_streams; t++) {
+                    char key[64];
+                    
+                    snprintf(key, sizeof(key), "%s_tile_%u_x", key_prefix, t);
+                    av_dict_set(&fgp->metadata, key, av_asprintf("%d", tile->offsets[t].horizontal), AV_DICT_DONT_STRDUP_VAL);
+                    
+                    snprintf(key, sizeof(key), "%s_tile_%u_y", key_prefix, t);
+                    av_dict_set(&fgp->metadata, key, av_asprintf("%d", tile->offsets[t].vertical), AV_DICT_DONT_STRDUP_VAL);
+                    
+                    snprintf(key, sizeof(key), "%s_tile_%u_index", key_prefix, t);
+                    av_dict_set(&fgp->metadata, key, av_asprintf("%u", t), AV_DICT_DONT_STRDUP_VAL);
+                }
+                
+                av_log(fg, AV_LOG_INFO, "Stored HEIF stream group %d metadata in filter graph for auto-compositor\n", (int)ss.list_id);
             }
         }
 
@@ -1915,6 +1976,10 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
     fgt->graph = avfilter_graph_alloc();
     if (!fgt->graph)
         return AVERROR(ENOMEM);
+    
+    // Pass HEIF metadata to the filter graph opaque field for filter access
+    if (fgp->metadata)
+        fgt->graph->opaque = fgp->metadata;
 
     if (simple) {
         OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[0]);

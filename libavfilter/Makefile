@@ -339,6 +339,7 @@ OBJS-$(CONFIG_GRAYWORLD_FILTER)              += vf_grayworld.o
 OBJS-$(CONFIG_GREYEDGE_FILTER)               += vf_colorconstancy.o
 OBJS-$(CONFIG_GUIDED_FILTER)                 += vf_guided.o framesync.o
 OBJS-$(CONFIG_HALDCLUT_FILTER)               += vf_lut3d.o framesync.o
+OBJS-$(CONFIG_HEIF_AUTO_COMPOSITOR_FILTER)   += vf_heif_tile_compositor_auto.o framesync.o
 OBJS-$(CONFIG_HFLIP_FILTER)                  += vf_hflip.o
 OBJS-$(CONFIG_HFLIP_VULKAN_FILTER)           += vf_flip_vulkan.o vulkan.o
 OBJS-$(CONFIG_HISTEQ_FILTER)                 += vf_histeq.o

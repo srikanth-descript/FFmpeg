@@ -3879,6 +3879,16 @@ do_output:
         if (!(avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN))
             av_frame_remove_side_data(frame, AV_FRAME_DATA_FILM_GRAIN_PARAMS);
 
+        // Propagate packet metadata to frame metadata
+        av_log(avctx, AV_LOG_DEBUG, "HEVC decoder: Attempting to propagate packet metadata (packet has %d side data entries)\n", avpkt->side_data_elems);
+        ret = ff_decode_frame_props_from_pkt(avctx, frame, avpkt);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_WARNING, "Failed to propagate packet metadata to frame\n");
+        } else {
+            av_log(avctx, AV_LOG_DEBUG, "HEVC decoder: Successfully propagated metadata, frame now has %d metadata entries\n", 
+                   frame->metadata ? av_dict_count(frame->metadata) : 0);
+        }
+
         return 0;
     }
 

@@ -38,6 +38,7 @@ HEADERS = adler32.h                                                     \
           film_grain_params.h                                           \
           frame.h                                                       \
           hash.h                                                        \
+          heif_color.h                                                  \
           hdr_dynamic_metadata.h                                        \
           hdr_dynamic_vivid_metadata.h                                  \
           hmac.h                                                        \
@@ -146,6 +147,7 @@ OBJS = adler32.o                                                        \
        fixed_dsp.o                                                      \
        frame.o                                                          \
        hash.o                                                           \
+       heif_color.o                                                     \
        hdr_dynamic_metadata.o                                           \
        hdr_dynamic_vivid_metadata.o                                     \
        hmac.o                                                           \
