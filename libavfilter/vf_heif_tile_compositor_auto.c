@@ -29,7 +29,6 @@
  * presentation cropping.
  */
 
-#include "libavutil/heif_color.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixfmt.h"
@@ -60,7 +59,6 @@ typedef struct HEIFAutoCompositorContext {
     // Options
     int nb_inputs;              ///< Number of input streams
     int target_grid_id;         ///< Specific grid ID to composite (-1 = auto)
-    int convert_p3_to_srgb;     ///< Color space conversion
     int auto_crop;              ///< Crop to presentation dimensions
     
     // Discovered from tile grid
@@ -80,7 +78,6 @@ typedef struct HEIFAutoCompositorContext {
 static const AVOption heif_auto_compositor_options[] = {
     { "inputs", "set number of input streams (0 = auto-detect)", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64=0}, 0, MAX_TILES, FLAGS },
     { "grid_id", "specific tile grid ID to composite (-1 = auto)", OFFSET(target_grid_id), AV_OPT_TYPE_INT, {.i64=-1}, -1, INT_MAX, FLAGS },
-    { "convert_p3", "convert Display P3 to sRGB", OFFSET(convert_p3_to_srgb), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
     { "auto_crop", "crop output to presentation dimensions", OFFSET(auto_crop), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
     { NULL }
 };
@@ -507,12 +504,10 @@ static int composite_tiles(FFFrameSync *fs)
                     int U = u_plane[uv_idx];
                     int V = v_plane[uv_idx];
                     
-                    uint8_t r, g, b;
-                    av_heif_yuv_to_rgb_pixel(Y, V, U, &r, &g, &b);
-                    
-                    if (s->convert_p3_to_srgb) {
-                        av_heif_convert_p3_to_srgb_pixel(&r, &g, &b);
-                    }
+                    // YUV to RGB conversion using FFmpeg macros
+                    int r = av_clip_uint8((298 * (Y - 16) + 409 * (V - 128) + 128) >> 8);
+                    int g = av_clip_uint8((298 * (Y - 16) - 100 * (U - 128) - 208 * (V - 128) + 128) >> 8);
+                    int b = av_clip_uint8((298 * (Y - 16) + 516 * (U - 128) + 128) >> 8);
                     
                     int out_idx = out_y * out_stride + out_x;
                     out_pixels[out_idx] = (255 << 24) | (r << 16) | (g << 8) | b;
