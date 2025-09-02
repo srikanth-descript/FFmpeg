@@ -14,6 +14,8 @@ OBJS = allformats.o         \
        demux_utils.o        \
        dump.o               \
        dv.o                 \
+       efpenc.o		    \
+       efpdec.o             \
        format.o             \
        id3v1.o              \
        id3v2.o              \
@@ -783,3 +785,4 @@ TOOLS     = aviocat                                                     \
             seek_print                                                  \
             sidxindex                                                   \
             venc_data_dump
+
