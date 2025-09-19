@@ -29,6 +29,7 @@
 
 #include "config_components.h"
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/emms.h"
 #include "libavutil/imgutils.h"
@@ -474,7 +475,7 @@ void ff_h264_flush_change(H264Context *h)
     h->mmco_reset = 1;
 }
 
-static void h264_decode_flush(AVCodecContext *avctx)
+static av_cold void h264_decode_flush(AVCodecContext *avctx)
 {
     H264Context *h = avctx->priv_data;
     int i;
@@ -754,7 +755,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
         if (h->cur_pic_ptr->decode_error_flags) {
             /* Frame-threading in use */
             atomic_int *decode_error = h->cur_pic_ptr->decode_error_flags;
-            /* Using atomics here is not supposed to provide syncronisation;
+            /* Using atomics here is not supposed to provide synchronisation;
              * they are merely used to allow to set decode_error from both
              * decoding threads in case of coded slices. */
             atomic_fetch_or_explicit(decode_error, FF_DECODE_ERROR_DECODE_SLICES,

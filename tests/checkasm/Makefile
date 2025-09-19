@@ -69,7 +69,13 @@ AVFILTEROBJS-$(CONFIG_SOBEL_FILTER)      += vf_convolution.o
 CHECKASMOBJS-$(CONFIG_AVFILTER) += $(AVFILTEROBJS-yes)
 
 # swscale tests
-SWSCALEOBJS                             += sw_gbrp.o sw_range_convert.o sw_rgb.o sw_scale.o sw_yuv2rgb.o sw_yuv2yuv.o
+SWSCALEOBJS                             += sw_gbrp.o            \
+                                           sw_ops.o             \
+                                           sw_range_convert.o   \
+                                           sw_rgb.o             \
+                                           sw_scale.o           \
+                                           sw_yuv2rgb.o         \
+                                           sw_yuv2yuv.o
 
 CHECKASMOBJS-$(CONFIG_SWSCALE)  += $(SWSCALEOBJS)
 
@@ -101,7 +107,7 @@ tests/checkasm/checkasm.o: CFLAGS += -Umain
 CHECKASM := tests/checkasm/checkasm$(EXESUF)
 
 $(CHECKASM): $(CHECKASMOBJS) $(FF_STATIC_DEP_LIBS)
-	$(LD) $(LDFLAGS) $(LDEXEFLAGS) $(LD_O) $(CHECKASMOBJS) $(FF_STATIC_DEP_LIBS) $(EXTRALIBS-avcodec) $(EXTRALIBS-avfilter) $(EXTRALIBS-avformat) $(EXTRALIBS-avutil) $(EXTRALIBS-swresample) $(EXTRALIBS)
+	$(call LINK,$(LDFLAGS) $(LDEXEFLAGS) $(LD_O) $(CHECKASMOBJS) $(FF_STATIC_DEP_LIBS) $(EXTRALIBS-avcodec) $(EXTRALIBS-avfilter) $(EXTRALIBS-avformat) $(EXTRALIBS-avutil) $(EXTRALIBS-swresample) $(EXTRALIBS))
 
 run-checkasm: $(CHECKASM)
 run-checkasm:

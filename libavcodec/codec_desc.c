@@ -1277,7 +1277,7 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .type      = AVMEDIA_TYPE_VIDEO,
         .name      = "hevc",
         .long_name = NULL_IF_CONFIG_SMALL("H.265 / HEVC (High Efficiency Video Coding)"),
-        .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_REORDER,
+        .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_LOSSLESS | AV_CODEC_PROP_REORDER,
         .profiles  = NULL_IF_CONFIG_SMALL(ff_hevc_profiles),
     },
     {
@@ -1648,7 +1648,7 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .type      = AVMEDIA_TYPE_VIDEO,
         .name      = "av1",
         .long_name = NULL_IF_CONFIG_SMALL("Alliance for Open Media AV1"),
-        .props     = AV_CODEC_PROP_LOSSY,
+        .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_LOSSLESS,
         .profiles  = NULL_IF_CONFIG_SMALL(ff_av1_profiles),
     },
     {
@@ -1991,6 +1991,14 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .name      = "apv",
         .long_name = NULL_IF_CONFIG_SMALL("Advanced Professional Video"),
         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+    },
+    {
+        .id        = AV_CODEC_ID_PRORES_RAW,
+        .type      = AVMEDIA_TYPE_VIDEO,
+        .name      = "prores_raw",
+        .long_name = NULL_IF_CONFIG_SMALL("Apple ProRes RAW"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY,
+        .profiles  = NULL_IF_CONFIG_SMALL(ff_prores_raw_profiles),
     },
 
     /* various PCM "codecs" */
@@ -3761,6 +3769,12 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .type      = AVMEDIA_TYPE_DATA,
         .name      = "lcevc",
         .long_name = NULL_IF_CONFIG_SMALL("LCEVC (Low Complexity Enhancement Video Coding) / MPEG-5 LCEVC / MPEG-5 part 2"),
+    },
+    {
+        .id        = AV_CODEC_ID_SMPTE_436M_ANC,
+        .type      = AVMEDIA_TYPE_DATA,
+        .name      = "smpte_436m_anc",
+        .long_name = NULL_IF_CONFIG_SMALL("MXF SMPTE-436M ANC"),
     },
     {
         .id        = AV_CODEC_ID_MPEG2TS,

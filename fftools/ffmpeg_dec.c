@@ -1594,7 +1594,7 @@ static int dec_open(DecoderPriv *dp, AVDictionary **dec_opts,
     if (o->flags & DECODER_FLAG_BITEXACT)
         dp->dec_ctx->flags |= AV_CODEC_FLAG_BITEXACT;
 
-    // we apply cropping outselves
+    // we apply cropping ourselves
     dp->apply_cropping          = dp->dec_ctx->apply_cropping;
     dp->dec_ctx->apply_cropping = 0;
 
@@ -1635,6 +1635,7 @@ static int dec_open(DecoderPriv *dp, AVDictionary **dec_opts,
             param_out->sample_aspect_ratio  = dp->dec_ctx->sample_aspect_ratio;
             param_out->colorspace           = dp->dec_ctx->colorspace;
             param_out->color_range          = dp->dec_ctx->color_range;
+            param_out->alpha_mode           = dp->dec_ctx->alpha_mode;
         }
 
         av_frame_side_data_free(&param_out->side_data, &param_out->nb_side_data);

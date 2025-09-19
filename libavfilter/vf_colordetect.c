@@ -37,14 +37,7 @@
 #include "formats.h"
 #include "video.h"
 
-#include "vf_colordetect.h"
-
-enum AlphaMode {
-    ALPHA_NONE = -1,
-    ALPHA_UNDETERMINED = 0,
-    ALPHA_STRAIGHT,
-    /* No way to positively identify premultiplied alpha */
-};
+#include "vf_colordetectdsp.h"
 
 enum ColorDetectMode {
     COLOR_DETECT_COLOR_RANGE = 1 << 0,
@@ -64,7 +57,7 @@ typedef struct ColorDetectContext {
     int mpeg_max;
 
     atomic_int detected_range; // enum AVColorRange
-    atomic_int detected_alpha; // enum AlphaMode
+    atomic_int detected_alpha; // enum FFAlphaDetect
 } ColorDetectContext;
 
 #define OFFSET(x) offsetof(ColorDetectContext, x)
@@ -124,9 +117,9 @@ static int config_input(AVFilterLink *inlink)
 
     if (desc->flags & AV_PIX_FMT_FLAG_ALPHA) {
         s->idx_a = desc->comp[desc->nb_components - 1].plane;
-        atomic_init(&s->detected_alpha, ALPHA_UNDETERMINED);
+        atomic_init(&s->detected_alpha, FF_ALPHA_UNDETERMINED);
     } else {
-        atomic_init(&s->detected_alpha, ALPHA_NONE);
+        atomic_init(&s->detected_alpha, FF_ALPHA_NONE);
     }
 
     ff_color_detect_dsp_init(&s->dsp, depth, inlink->color_range);
@@ -145,7 +138,8 @@ static int detect_range(AVFilterContext *ctx, void *arg,
 
     if (s->dsp.detect_range(in->data[0] + y_start * stride, stride,
                             in->width, h_slice, s->mpeg_min, s->mpeg_max))
-        atomic_store(&s->detected_range, AVCOL_RANGE_JPEG);
+        atomic_store_explicit(&s->detected_range, AVCOL_RANGE_JPEG,
+                              memory_order_relaxed);
 
     return 0;
 }
@@ -172,23 +166,24 @@ static int detect_alpha(AVFilterContext *ctx, void *arg,
      *
      * This simplifies to:
      *   (x - mpeg_min) * pixel_max > (mpeg_max - mpeg_min) * a
-     *   = P * x - K > Q * a in the below formula.
+     *   = alpha_max * x - offset > mpeg_range * a in the below formula.
      *
      * We subtract an additional offset of (1 << (depth - 1)) to account for
-     * rounding errors in the value of `x`, and an extra safety margin of
-     * Q because vf_premultiply.c et al. add an offset of (a >> 1) & 1.
+     * rounding errors in the value of `x`.
      */
-    const int p = (1 << s->depth) - 1;
-    const int q = s->mpeg_max - s->mpeg_min;
-    const int k = p * s->mpeg_min + q + (1 << (s->depth - 1));
+    const int alpha_max = (1 << s->depth) - 1;
+    const int mpeg_range = s->mpeg_max - s->mpeg_min;
+    const int offset = alpha_max * s->mpeg_min + (1 << (s->depth - 1));
 
+    int ret = 0;
     for (int i = 0; i < nb_planes; i++) {
         const ptrdiff_t stride = in->linesize[i];
-        if (s->dsp.detect_alpha(in->data[i] + y_start * stride, stride,
-                                alpha, alpha_stride, w, h_slice, p, q, k)) {
-            atomic_store(&s->detected_alpha, ALPHA_STRAIGHT);
-            return 0;
-        }
+        ret = s->dsp.detect_alpha(in->data[i] + y_start * stride, stride,
+                                  alpha, alpha_stride, w, h_slice, alpha_max,
+                                  mpeg_range, offset);
+        ret |= atomic_fetch_or_explicit(&s->detected_alpha, ret, memory_order_relaxed);
+        if (ret == FF_ALPHA_STRAIGHT)
+            break;
     }
 
     return 0;
@@ -200,9 +195,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     ColorDetectContext *s = ctx->priv;
     const int nb_threads = FFMIN(inlink->h, s->nb_threads);
 
-    if (s->mode & COLOR_DETECT_COLOR_RANGE && s->detected_range == AVCOL_RANGE_UNSPECIFIED)
+    enum AVColorRange detected_range = atomic_load_explicit(&s->detected_range, memory_order_relaxed);
+    if (s->mode & COLOR_DETECT_COLOR_RANGE && detected_range == AVCOL_RANGE_UNSPECIFIED)
         ff_filter_execute(ctx, detect_range, in, NULL, nb_threads);
-    if (s->mode & COLOR_DETECT_ALPHA_MODE && s->detected_alpha == ALPHA_UNDETERMINED)
+
+    enum FFAlphaDetect detected_alpha = atomic_load_explicit(&s->detected_alpha, memory_order_relaxed);
+    if (s->mode & COLOR_DETECT_ALPHA_MODE && detected_alpha != FF_ALPHA_NONE &&
+        detected_alpha != FF_ALPHA_STRAIGHT)
         ff_filter_execute(ctx, detect_alpha, in, NULL, nb_threads);
 
     return ff_filter_frame(inlink->dst->outputs[0], in);
@@ -216,34 +215,21 @@ static av_cold void uninit(AVFilterContext *ctx)
 
     av_log(ctx, AV_LOG_INFO, "Detected color properties:\n");
     if (s->mode & COLOR_DETECT_COLOR_RANGE) {
+        enum AVColorRange detected_range = atomic_load_explicit(&s->detected_range,
+                                                                memory_order_relaxed);
         av_log(ctx, AV_LOG_INFO, "  Color range: %s\n",
-               s->detected_range == AVCOL_RANGE_JPEG ? "JPEG / full range"
-                                                     : "undetermined");
+               detected_range == AVCOL_RANGE_JPEG ? "JPEG / full range"
+                                                  : "undetermined");
     }
 
     if (s->mode & COLOR_DETECT_ALPHA_MODE) {
+        enum FFAlphaDetect detected_alpha = atomic_load_explicit(&s->detected_alpha,
+                                                                 memory_order_relaxed);
         av_log(ctx, AV_LOG_INFO, "  Alpha mode: %s\n",
-               s->detected_alpha == ALPHA_NONE     ? "none" :
-               s->detected_alpha == ALPHA_STRAIGHT ? "straight / independent"
-                                                   : "undetermined");
-    }
-}
-
-av_cold void ff_color_detect_dsp_init(FFColorDetectDSPContext *dsp, int depth,
-                                      enum AVColorRange color_range)
-{
-#if ARCH_X86
-    ff_color_detect_dsp_init_x86(dsp, depth, color_range);
-#endif
-
-    if (!dsp->detect_range)
-        dsp->detect_range = depth > 8 ? ff_detect_range16_c : ff_detect_range_c;
-    if (!dsp->detect_alpha) {
-        if (color_range == AVCOL_RANGE_JPEG) {
-            dsp->detect_alpha = depth > 8 ? ff_detect_alpha16_full_c : ff_detect_alpha_full_c;
-        } else {
-            dsp->detect_alpha = depth > 8 ? ff_detect_alpha16_limited_c : ff_detect_alpha_limited_c;
-        }
+               detected_alpha == FF_ALPHA_NONE        ? "none" :
+               detected_alpha == FF_ALPHA_STRAIGHT    ? "straight" :
+               detected_alpha == FF_ALPHA_TRANSPARENT ? "undetermined"
+                                                      : "opaque");
     }
 }
 

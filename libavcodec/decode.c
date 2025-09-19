@@ -47,6 +47,7 @@
 #include "codec_desc.h"
 #include "codec_internal.h"
 #include "decode.h"
+#include "exif.h"
 #include "hwaccel_internal.h"
 #include "hwconfig.h"
 #include "internal.h"
@@ -567,6 +568,8 @@ static int fill_frame_props(const AVCodecContext *avctx, AVFrame *frame)
         frame->color_range = avctx->color_range;
     if (frame->chroma_location == AVCHROMA_LOC_UNSPECIFIED)
         frame->chroma_location = avctx->chroma_sample_location;
+    if (frame->alpha_mode == AVALPHA_MODE_UNSPECIFIED)
+        frame->alpha_mode = avctx->alpha_mode;
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
             if (!frame->sample_aspect_ratio.num)  frame->sample_aspect_ratio = avctx->sample_aspect_ratio;
@@ -1388,6 +1391,78 @@ static int side_data_stereo3d_merge(AVFrameSideData *sd_frame,
     return 0;
 }
 
+static int side_data_exif_parse(AVFrame *dst, const AVPacketSideData *sd_pkt)
+{
+    AVExifMetadata ifd = { 0 };
+    AVExifEntry *entry = NULL;
+    AVBufferRef *buf = NULL;
+    AVFrameSideData *sd_frame;
+    int ret;
+
+    ret = av_exif_parse_buffer(NULL, sd_pkt->data, sd_pkt->size, &ifd,
+                               AV_EXIF_TIFF_HEADER);
+    if (ret < 0)
+        return ret;
+
+    ret = av_exif_get_entry(NULL, &ifd, av_exif_get_tag_id("Orientation"), 0, &entry);
+    if (ret < 0)
+        goto end;
+
+    if (!entry) {
+        ret = av_exif_ifd_to_dict(NULL, &ifd, &dst->metadata);
+        if (ret < 0)
+            goto end;
+
+        sd_frame = av_frame_side_data_new(&dst->side_data, &dst->nb_side_data, AV_FRAME_DATA_EXIF,
+                                          sd_pkt->size, 0);
+        if (sd_frame)
+            memcpy(sd_frame->data, sd_pkt->data, sd_pkt->size);
+        ret = sd_frame ? 0 : AVERROR(ENOMEM);
+
+        goto end;
+    } else if (entry->count <= 0 || entry->type != AV_TIFF_SHORT) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+
+    // If a display matrix already exists in the frame, give it priority
+    if (av_frame_side_data_get(dst->side_data, dst->nb_side_data, AV_FRAME_DATA_DISPLAYMATRIX))
+        goto finish;
+
+    sd_frame = av_frame_side_data_new(&dst->side_data, &dst->nb_side_data, AV_FRAME_DATA_DISPLAYMATRIX,
+                                      sizeof(int32_t) * 9, 0);
+    if (!sd_frame) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    ret = av_exif_orientation_to_matrix((int32_t *)sd_frame->data, entry->value.uint[0]);
+    if (ret < 0)
+        goto end;
+
+finish:
+    av_exif_remove_entry(NULL, &ifd, entry->id, 0);
+
+    ret = av_exif_ifd_to_dict(NULL, &ifd, &dst->metadata);
+    if (ret < 0)
+        goto end;
+
+    ret = av_exif_write(NULL, &ifd, &buf, AV_EXIF_TIFF_HEADER);
+    if (ret < 0)
+        goto end;
+
+    if (!av_frame_side_data_add(&dst->side_data, &dst->nb_side_data, AV_FRAME_DATA_EXIF, &buf, 0)) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    ret = 0;
+end:
+    av_buffer_unref(&buf);
+    av_exif_free(&ifd);
+    return ret;
+}
+
 static int side_data_map(AVFrame *dst,
                          const AVPacketSideData *sd_src, int nb_sd_src,
                          const SideDataMap *map)
@@ -1414,11 +1489,21 @@ static int side_data_map(AVFrame *dst,
             continue;
         }
 
-        sd_frame = av_frame_new_side_data(dst, type_frame, sd_pkt->size);
-        if (!sd_frame)
-            return AVERROR(ENOMEM);
+        switch (type_pkt) {
+        case AV_PKT_DATA_EXIF: {
+            int ret = side_data_exif_parse(dst, sd_pkt);
+            if (ret < 0)
+                return ret;
+            break;
+        }
+        default:
+            sd_frame = av_frame_new_side_data(dst, type_frame, sd_pkt->size);
+            if (!sd_frame)
+                return AVERROR(ENOMEM);
 
-        memcpy(sd_frame->data, sd_pkt->data, sd_pkt->size);
+            memcpy(sd_frame->data, sd_pkt->data, sd_pkt->size);
+            break;
+        }
     }
 
     return 0;
@@ -2235,6 +2320,8 @@ void ff_decode_internal_sync(AVCodecContext *dst, const AVCodecContext *src)
     const DecodeContext *src_dc = decode_ctx(src->internal);
     DecodeContext *dst_dc = decode_ctx(dst->internal);
 
+    dst_dc->initial_pict_type = src_dc->initial_pict_type;
+    dst_dc->intra_only_flag   = src_dc->intra_only_flag;
     av_refstruct_replace(&dst_dc->lcevc, src_dc->lcevc);
 }
 
@@ -2244,4 +2331,105 @@ void ff_decode_internal_uninit(AVCodecContext *avctx)
     DecodeContext *dc = decode_ctx(avci);
 
     av_refstruct_unref(&dc->lcevc);
+}
+
+static int attach_displaymatrix(AVCodecContext *avctx, AVFrame *frame, int orientation)
+{
+    AVFrameSideData *sd = NULL;
+    int32_t *matrix;
+    int ret;
+    /* invalid orientation */
+    if (orientation < 1 || orientation > 8)
+        return AVERROR_INVALIDDATA;
+    ret = ff_frame_new_side_data(avctx, frame, AV_FRAME_DATA_DISPLAYMATRIX, sizeof(int32_t) * 9, &sd);
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Could not allocate frame side data: %s\n", av_err2str(ret));
+        return ret;
+    }
+    if (sd) {
+        matrix = (int32_t *) sd->data;
+        ret = av_exif_orientation_to_matrix(matrix, orientation);
+    }
+
+    return ret;
+}
+
+static int exif_attach_ifd(AVCodecContext *avctx, AVFrame *frame, const AVExifMetadata *ifd, AVBufferRef **pbuf)
+{
+    const AVExifEntry *orient = NULL;
+    AVExifMetadata *cloned = NULL;
+    int ret;
+
+    for (size_t i = 0; i < ifd->count; i++) {
+        const AVExifEntry *entry = &ifd->entries[i];
+        if (entry->id == av_exif_get_tag_id("Orientation") &&
+            entry->count > 0 && entry->type == AV_TIFF_SHORT) {
+            orient = entry;
+            break;
+        }
+    }
+
+    if (orient) {
+        av_log(avctx, AV_LOG_DEBUG, "found EXIF orientation: %" PRIu64 "\n", orient->value.uint[0]);
+        ret = attach_displaymatrix(avctx, frame, orient->value.uint[0]);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_WARNING, "unable to attach displaymatrix from EXIF\n");
+        } else {
+            cloned = av_exif_clone_ifd(ifd);
+            if (!cloned) {
+                ret = AVERROR(ENOMEM);
+                goto end;
+            }
+            av_exif_remove_entry(avctx, cloned, orient->id, 0);
+            ifd = cloned;
+        }
+    }
+
+    ret = av_exif_ifd_to_dict(avctx, ifd, &frame->metadata);
+    if (ret < 0)
+        goto end;
+
+    if (cloned || !*pbuf) {
+        av_buffer_unref(pbuf);
+        ret = av_exif_write(avctx, ifd, pbuf, AV_EXIF_TIFF_HEADER);
+        if (ret < 0)
+            goto end;
+    }
+
+    ret = ff_frame_new_side_data_from_buf(avctx, frame, AV_FRAME_DATA_EXIF, pbuf);
+    if (ret < 0)
+        goto end;
+
+    ret = 0;
+
+end:
+    av_buffer_unref(pbuf);
+    av_exif_free(cloned);
+    av_free(cloned);
+    return ret;
+}
+
+int ff_decode_exif_attach_ifd(AVCodecContext *avctx, AVFrame *frame, const AVExifMetadata *ifd)
+{
+    AVBufferRef *dummy = NULL;
+    return exif_attach_ifd(avctx, frame, ifd, &dummy);
+}
+
+int ff_decode_exif_attach_buffer(AVCodecContext *avctx, AVFrame *frame, AVBufferRef **pbuf,
+                                 enum AVExifHeaderMode header_mode)
+{
+    int ret;
+    AVBufferRef *data = *pbuf;
+    AVExifMetadata ifd = { 0 };
+
+    ret = av_exif_parse_buffer(avctx, data->data, data->size, &ifd, header_mode);
+    if (ret < 0)
+        goto end;
+
+    ret = exif_attach_ifd(avctx, frame, &ifd, pbuf);
+
+end:
+    av_buffer_unref(pbuf);
+    av_exif_free(&ifd);
+    return ret;
 }

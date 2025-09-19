@@ -733,7 +733,7 @@ static int vp8_decode_frame_header(VP8Context *s, const uint8_t *buf, int buf_si
     int height = s->avctx->height;
 
     if (buf_size < 3) {
-        av_log(s->avctx, AV_LOG_ERROR, "Insufficent data (%d) for header\n", buf_size);
+        av_log(s->avctx, AV_LOG_ERROR, "Insufficient data (%d) for header\n", buf_size);
         return AVERROR_INVALIDDATA;
     }
 
@@ -2416,7 +2416,7 @@ static av_always_inline int decode_mb_row_no_filter(AVCodecContext *avctx, void 
         mb = s->macroblocks_base + ((s->mb_width + 1) * (mb_y + 1) + 1);
     else {
         // Make sure the previous frame has read its segmentation map,
-        // if we re-use the same map.
+        // if we reuse the same map.
         if (prev_frame && s->segmentation.enabled &&
             !s->segmentation.update_map)
             ff_progress_frame_await(&prev_frame->tf, mb_y);
@@ -2522,18 +2522,12 @@ static av_always_inline void filter_mb_row(AVCodecContext *avctx, void *tdata,
     VP8ThreadData *td = &s->thread_data[threadnr];
     int mb_x, mb_y = atomic_load(&td->thread_mb_pos) >> 16, num_jobs = s->num_jobs;
     AVFrame *curframe = s->curframe->tf.f;
-    VP8Macroblock *mb;
     VP8ThreadData *prev_td, *next_td;
     uint8_t *dst[3] = {
         curframe->data[0] + 16 * mb_y * s->linesize,
         curframe->data[1] +  8 * mb_y * s->uvlinesize,
         curframe->data[2] +  8 * mb_y * s->uvlinesize
     };
-
-    if (s->mb_layout == 1)
-        mb = s->macroblocks_base + ((s->mb_width + 1) * (mb_y + 1) + 1);
-    else
-        mb = s->macroblocks + (s->mb_height - mb_y - 1) * 2;
 
     if (mb_y == 0)
         prev_td = td;
@@ -2544,7 +2538,7 @@ static av_always_inline void filter_mb_row(AVCodecContext *avctx, void *tdata,
     else
         next_td = &s->thread_data[(jobnr + 1) % num_jobs];
 
-    for (mb_x = 0; mb_x < s->mb_width; mb_x++, mb++) {
+    for (mb_x = 0; mb_x < s->mb_width; mb_x++) {
         const VP8FilterStrength *f = &td->filter_strength[mb_x];
         if (prev_td != td)
             check_thread_pos(td, prev_td,
@@ -2761,7 +2755,7 @@ int vp78_decode_frame(AVCodecContext *avctx, AVFrame *rframe, int *got_frame,
 
         if (s->mb_layout == 1) {
             // Make sure the previous frame has read its segmentation map,
-            // if we re-use the same map.
+            // if we reuse the same map.
             if (prev_frame && s->segmentation.enabled &&
                 !s->segmentation.update_map)
                 ff_progress_frame_await(&prev_frame->tf, 1);

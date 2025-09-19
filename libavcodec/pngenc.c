@@ -22,6 +22,7 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "encode.h"
+#include "exif_internal.h"
 #include "bytestream.h"
 #include "lossless_videoencdsp.h"
 #include "png.h"
@@ -29,6 +30,7 @@
 #include "zlib_wrapper.h"
 
 #include "libavutil/avassert.h"
+#include "libavutil/buffer.h"
 #include "libavutil/crc.h"
 #include "libavutil/csp.h"
 #include "libavutil/libm.h"
@@ -373,6 +375,7 @@ static int encode_headers(AVCodecContext *avctx, const AVFrame *pict)
 {
     AVFrameSideData *side_data;
     PNGEncContext *s = avctx->priv_data;
+    AVBufferRef *exif_data = NULL;
     int ret;
 
     /* write png header */
@@ -412,6 +415,19 @@ static int encode_headers(AVCodecContext *avctx, const AVFrame *pict)
                 av_log(avctx, AV_LOG_WARNING, "Only side-by-side stereo3d flag can be defined within sTER chunk\n");
                 break;
         }
+    }
+
+    ret = ff_exif_get_buffer(avctx, pict, &exif_data, AV_EXIF_TIFF_HEADER);
+    if (exif_data) {
+        // png_write_chunk accepts an int, not a size_t, so we have to check overflow
+        if (exif_data->size > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE)
+            // that's a very big exif chunk, probably a bug
+            av_log(avctx, AV_LOG_ERROR, "extremely large EXIF buffer detected, not writing\n");
+        else
+            png_write_chunk(&s->bytestream, MKTAG('e','X','I','f'), exif_data->data, exif_data->size);
+        av_buffer_unref(&exif_data);
+    } else if (ret < 0) {
+        av_log(avctx, AV_LOG_WARNING, "unable to attach EXIF metadata: %s\n", av_err2str(ret));
     }
 
     side_data = av_frame_get_side_data(pict, AV_FRAME_DATA_ICC_PROFILE);
@@ -1239,6 +1255,9 @@ const FFCodec ff_png_encoder = {
                   AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY8A,
                   AV_PIX_FMT_GRAY16BE, AV_PIX_FMT_YA16BE,
                   AV_PIX_FMT_MONOBLACK),
+    .alpha_modes    = (const enum AVAlphaMode[]) {
+        AVALPHA_MODE_STRAIGHT, AVALPHA_MODE_UNSPECIFIED
+    },
     .p.priv_class   = &pngenc_class,
     .caps_internal  = FF_CODEC_CAP_ICC_PROFILES,
 };
@@ -1259,6 +1278,9 @@ const FFCodec ff_apng_encoder = {
                   AV_PIX_FMT_PAL8,
                   AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY8A,
                   AV_PIX_FMT_GRAY16BE, AV_PIX_FMT_YA16BE),
+    .alpha_modes    = (const enum AVAlphaMode[]) {
+        AVALPHA_MODE_STRAIGHT, AVALPHA_MODE_UNSPECIFIED
+    },
     .p.priv_class   = &pngenc_class,
     .caps_internal  = FF_CODEC_CAP_ICC_PROFILES,
 };

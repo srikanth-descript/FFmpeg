@@ -96,7 +96,7 @@ enum AVFrameSideDataType {
      */
     AV_FRAME_DATA_MOTION_VECTORS,
     /**
-     * Recommmends skipping the specified number of samples. This is exported
+     * Recommends skipping the specified number of samples. This is exported
      * only if the "skip_manual" AVOption is set in libavcodec.
      * This has the same format as AV_PKT_DATA_SKIP_SAMPLES.
      * @code
@@ -254,6 +254,12 @@ enum AVFrameSideDataType {
      * libavutil/tdrdi.h.
      */
     AV_FRAME_DATA_3D_REFERENCE_DISPLAYS,
+
+    /**
+     * Extensible image file format metadata. The payload is a buffer containing
+     * EXIF metadata, starting with either 49 49 2a 00, or 4d 4d 00 2a.
+     */
+     AV_FRAME_DATA_EXIF,
 };
 
 enum AVActiveFormatDescription {
@@ -767,6 +773,13 @@ typedef struct AVFrame {
      * Duration of the frame, in the same units as pts. 0 if unknown.
      */
     int64_t duration;
+
+    /**
+     * Indicates how the alpha channel of the video is to be handled.
+     * - encoding: Set by user
+     * - decoding: Set by libavcodec
+     */
+    enum AVAlphaMode alpha_mode;
 } AVFrame;
 
 

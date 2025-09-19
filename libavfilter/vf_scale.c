@@ -520,6 +520,12 @@ static int query_formats(const AVFilterContext *ctx,
     if ((ret = ff_formats_ref(formats, &cfg_out[0]->color_ranges)) < 0)
         return ret;
 
+    if (scale->sws->alpha_blend) {
+        if ((ret = ff_formats_ref(ff_make_formats_list_singleton(AVALPHA_MODE_STRAIGHT),
+                                  &cfg_in[0]->alpha_modes)) < 0)
+            return ret;
+    }
+
     return 0;
 }
 
@@ -837,6 +843,7 @@ scale:
     out->height = outlink->h;
     out->color_range = outlink->color_range;
     out->colorspace = outlink->colorspace;
+    out->alpha_mode = outlink->alpha_mode;
     if (scale->out_chroma_loc != AVCHROMA_LOC_UNSPECIFIED)
         out->chroma_location = scale->out_chroma_loc;
     if (scale->out_primaries != -1)
@@ -1075,10 +1082,12 @@ static const AVOption scale_options[] = {
         { "bt601",       NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_BT470BG},        0, 0, FLAGS, .unit = "color" },
         { "bt470",       NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_BT470BG},        0, 0, FLAGS, .unit = "color" },
         { "smpte170m",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_BT470BG},        0, 0, FLAGS, .unit = "color" },
+        { "bt470bg",     NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_BT470BG},        0, 0, FLAGS, .unit = "color" },
         { "bt709",       NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_BT709},          0, 0, FLAGS, .unit = "color" },
         { "fcc",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_FCC},            0, 0, FLAGS, .unit = "color" },
         { "smpte240m",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_SMPTE240M},      0, 0, FLAGS, .unit = "color" },
         { "bt2020",      NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_BT2020_NCL},     0, 0, FLAGS, .unit = "color" },
+        { "bt2020nc",    NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_SPC_BT2020_NCL},     0, 0, FLAGS, .unit = "color" },
     {  "in_range", "set input color range",  OFFSET( in_range), AV_OPT_TYPE_INT, {.i64 = AVCOL_RANGE_UNSPECIFIED }, 0, 2, FLAGS, .unit = "range" },
     { "out_range", "set output color range", OFFSET(out_range), AV_OPT_TYPE_INT, {.i64 = AVCOL_RANGE_UNSPECIFIED }, 0, 2, FLAGS, .unit = "range" },
         { "auto",        NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVCOL_RANGE_UNSPECIFIED }, 0, 0, FLAGS, .unit = "range" },

@@ -216,7 +216,7 @@ filter input and output pads of all the filterchains are connected.
 
 Leading and trailing whitespaces (space, tabs, or line feeds) separating tokens
 in the filtergraph specification are ignored. This means that the filtergraph
-can be expressed using empty lines and spaces to improve redability.
+can be expressed using empty lines and spaces to improve readability.
 
 For example, the filtergraph:
 @example
@@ -577,6 +577,11 @@ The cross fade is applied for specified duration near the end of first stream.
 The filter accepts the following options:
 
 @table @option
+@item inputs, n
+Specify the number of inputs to crossfade. When crossfading multiple inputs,
+each input will be concatenated and crossfaded in sequence, similar to the
+@ref{concat filter}. Default is 2.
+
 @item nb_samples, ns
 Specify the number of samples for which the cross fade effect has to last.
 At the end of the cross fade effect the first input audio will be completely
@@ -614,6 +619,11 @@ ffmpeg -i first.flac -i second.flac -filter_complex acrossfade=d=10:c1=exp:c2=ex
 Cross fade from one input to another but without overlapping:
 @example
 ffmpeg -i first.flac -i second.flac -filter_complex acrossfade=d=10:o=0:c1=exp:c2=exp output.flac
+@end example
+
+Concatenate multiple inputs with cross fade between each:
+@example
+ffmpeg -i first.flac -i second.flac -i third.flac -filter_complex acrossfade=n=3 output.flac
 @end example
 @end itemize
 
@@ -3383,7 +3393,7 @@ where applicable, an overall figure is also given.
 It accepts the following option:
 @table @option
 @item length
-Short window length in seconds, used for peak and trough RMS measurement.
+Short window length in seconds, used for peak and through RMS measurement.
 Default is @code{0.05} (50 milliseconds). Allowed range is @code{[0 - 10]}.
 
 @item metadata
@@ -3544,7 +3554,7 @@ standard RMS level measured in dBFS
 
 @item RMS_peak
 @item RMS_trough
-peak and trough values for RMS level measured over a short window,
+peak and through values for RMS level measured over a short window,
 measured in dBFS.
 
 @item Zero crossings
@@ -7682,6 +7692,113 @@ There are 6 samples at -4 dB, 62 at -5 dB, 286 at -6 dB, etc.
 In other words, raising the volume by +4 dB does not cause any clipping,
 raising it by +5 dB causes clipping for 6 samples, etc.
 
+@anchor{whisper}
+@section whisper
+
+It runs automatic speech recognition using the OpenAI's Whisper model.
+
+It requires the whisper.cpp library (https://github.com/ggml-org/whisper.cpp)
+as a prerequisite. After installing the library it can be enabled using:
+@code{./configure --enable-whisper}.
+
+The filter has following options:
+
+@table @option
+@item model
+The file path of the downloaded whisper.cpp model (mandatory).
+
+@item language
+The language to use for transcription ('auto' for auto-detect).
+Default value: @code{"auto"}
+
+@item queue
+The maximum size that will be queued into the filter before processing the audio
+with whisper. Using a small value the audio stream will be processed more often,
+but the transcription quality will be lower and the required processing power
+will be higher. Using a large value (e.g. 10-20s) will produce more accurate
+results using less CPU (as using the whisper-cli tool), but the transcription
+latency will be higher, thus not useful to process real-time streams.
+Consider using the vad_model option associated with a large queue value.
+Default value: @code{"3"}
+
+@item use_gpu
+If the GPU support should be enabled.
+Default value: @code{"true"}
+
+@item gpu_device
+The GPU device index to use.
+Default value: @code{"0"}
+
+@item destination
+If set, the transcription output will be sent to the specified file or URL
+(use one of the FFmpeg AVIO protocols); otherwise, the output will be logged as
+info messages.
+The output will also be set in the "lavfi.whisper.text" frame metadata.
+If the destination is a file and it already exists, it will be overwritten.
+
+@item format
+The destination format string; it could be "text" (only the transcribed text
+will be sent to the destination), "srt" (subtitle format) or "json".
+Default value: @code{"text"}
+
+@item vad_model
+Path to the VAD model file. If set, the filter will load an additional voice
+activity detection module (https://github.com/snakers4/silero-vad) that will be
+used to fragment the audio queue; use this option setting a valid path obtained
+from the whisper.cpp repository (e.g. "../whisper.cpp/models/ggml-silero-v5.1.2.bin")
+and increase the queue parameter to a higher value (e.g. 20).
+
+@item vad_threshold
+The VAD threshold to use.
+Default value: @code{"0.5"}
+
+@item vad_min_speech_duration
+The minimum VAD speaking duration.
+Default value: @code{"0.1"}
+
+@item vad_min_silence_duration
+The minimum VAD silence duration.
+Default value: @code{"0.5"}
+
+@end table
+
+@subsection Examples
+@itemize
+
+@item
+Run a transcription with srt file generation:
+@example
+ffmpeg -i input.mp4 -vn -af "whisper=model=../whisper.cpp/models/ggml-base.en.bin\
+:language=en\
+:queue=3\
+:destination=output.srt\
+:format=srt" -f null -
+@end example
+
+@item
+Run a transcription and send the output in JSON format to an HTTP service:
+@example
+ffmpeg -i input.mp4 -vn -af "whisper=model=../whisper.cpp/models/ggml-base.en.bin\
+:language=en\
+:queue=3\
+:destination=http\\://localhost\\:3000\
+:format=json' -f null -
+@end example
+
+@item
+Transcribe the microphone input using the VAD option:
+@example
+ffmpeg -loglevel warning -f pulse -i default \
+-af 'highpass=f=200,lowpass=f=3000,whisper=model=../whisper.cpp/models/ggml-medium.bin\
+:language=en\
+:queue=10\
+:destination=-\
+:format=json\
+:vad_model=../whisper.cpp/models/ggml-silero-v5.1.2.bin' -f null -
+@end example
+
+@end itemize
+
 @c man end AUDIO FILTERS
 
 @chapter Audio Sources
@@ -7904,7 +8021,7 @@ Gains are separated by white spaces and each gain is set in dBFS.
 Default is @code{0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0}.
 
 @item bands, b
-Set the custom bands from where custon equalizer gains are set.
+Set the custom bands from where custom equalizer gains are set.
 This must be in strictly increasing order. Only used if the preset option is set to @code{custom}.
 Bands are separated by white spaces and each band represent frequency in Hz.
 Default is @code{25 40 63 100 160 250 400 630 1000 1600 2500 4000 6300 10000 16000 24000}.
@@ -9214,7 +9331,7 @@ The default value is @code{all}.
 
 Repack CEA-708 closed captioning side data
 
-This filter fixes various issues seen with commerical encoders
+This filter fixes various issues seen with commercial encoders
 related to upstream malformed CEA-708 payloads, specifically
 incorrect number of tuples (wrong cc_count for the target FPS),
 and incorrect ordering of tuples (i.e. the CEA-608 tuples are not at
@@ -9357,19 +9474,19 @@ Mostly useful to speed-up filtering.
 @item threy
 Set Y threshold for averaging chrominance values.
 Set finer control for max allowed difference between Y components
-of current pixel and neigbour pixels.
+of current pixel and neighbour pixels.
 Default value is 200. Allowed range is from 1 to 200.
 
 @item threu
 Set U threshold for averaging chrominance values.
 Set finer control for max allowed difference between U components
-of current pixel and neigbour pixels.
+of current pixel and neighbour pixels.
 Default value is 200. Allowed range is from 1 to 200.
 
 @item threv
 Set V threshold for averaging chrominance values.
 Set finer control for max allowed difference between V components
-of current pixel and neigbour pixels.
+of current pixel and neighbour pixels.
 Default value is 200. Allowed range is from 1 to 200.
 
 @item distance
@@ -9768,12 +9885,12 @@ Accepts a combination of the following flags:
 
 @table @samp
 @item color_range
-Detect if the source countains luma pixels outside the limited (MPEG) range,
+Detect if the source contains luma pixels outside the limited (MPEG) range,
 which indicates that this is a full range YUV source.
 @item alpha_mode
 Detect if the source contains color values above the alpha channel, which
 indicates that the alpha channel is independent (straight), rather than
-premultiplied.
+premultiplied. Also detects if the alpha plane is fully opaque or not.
 @item all
 Enable detection of all of the above properties. This is the default.
 @end table
@@ -10294,6 +10411,18 @@ von Kries whitepoint adaptation
 
 @item identity
 identity whitepoint adaptation (i.e. no whitepoint adaptation)
+@end table
+
+@item clipgamut
+Controls how to clip out-of-gamut colors that arise as a result of colorspace conversion.
+
+The accepted values are:
+@table @samp
+@item none
+No clipping of out of gamut colors.
+
+@item rgb
+Clips the RGB values to the [0, 1] range when building the gamma transfer LUTs.
 @end table
 
 @item iall
@@ -14200,6 +14329,10 @@ A '|'-separated list of color space names, such as
 A '|'-separated list of color range names, such as
 "color_ranges=tv|pc".
 
+@item alpha_modes
+A '|'-separated list of color range names, such as
+"alpha_modes=straight|premultiplied".
+
 @end table
 
 @subsection Examples
@@ -16348,6 +16481,36 @@ Render frames with rounded corners. The value, given as a float ranging from
 square to fully circular. In other words, it gives the radius divided by half
 the smaller side length. Defaults to @code{0.0}.
 
+@item lut
+Specifies a custom LUT (in Adobe .cube format) to apply to the colors
+as part of color conversion. The exact interpretation depends on the value
+of @option{lut_type}.
+
+@item lut_type
+Controls the interpretation of color values fed to and from the LUT
+specified as @option{lut}. Valid values are:
+
+@table @samp
+@item auto
+Chooses the interpretation of the LUT automatically from tagged
+metadata, and otherwise falls back to @samp{native}. (Default)
+
+@item native
+Applied to raw image contents in its native RGB colorspace (non-linear
+light), before conversion to the output color space.
+
+@item normalized
+Applied to the normalized RGB image contents, in linear light, before
+conversion to the output color space.
+
+@item conversion
+Fully replaces the conversion from the image color space to the output
+color space. If such a LUT is present, it has the highest priority, and
+overrides any ICC profiles, as well as options related to tone mapping
+and output colorimetry (@option{color_primaries}, @option{color_trc}).
+
+@end table
+
 @item extra_opts
 Pass extra libplacebo internal configuration options. These can be specified
 as a list of @var{key}=@var{value} pairs separated by ':'. The following example
@@ -16379,6 +16542,10 @@ value of @code{auto} outputs frames in the same format as the input frames,
 leading to no change. For any other value, conversion will be performed.
 
 See the @ref{setparams} filter for a list of possible values.
+
+@item alpha_mode
+Choose the desired output alpha mode, when the output format has an alpha
+channel. See the @ref{setparams} filter for a list of possible values.
 
 @item apply_filmgrain
 Apply film grain (e.g. AV1 or H.274) if present in source frames, and strip
@@ -16517,6 +16684,8 @@ No deinterlacing, weave fields together into a single frame. This is the default
 Naive bob deinterlacing, simply repeat each field line twice.
 @item yadif
 Yet another deinterlacing filter. See the @ref{yadif} filter for more details.
+@item bwdif
+Bob weaver deinterlacing filter. See the @ref{bwdif} filter for more details.
 @end table
 
 @item skip_spatial_check
@@ -18728,7 +18897,8 @@ See @ref{framesync}.
 
 @item alpha
 Set format of alpha of the overlaid video, it can be @var{straight} or
-@var{premultiplied}. Default is @var{straight}.
+@var{premultiplied}, or @var{auto} to choose the alpha mode automatically.
+Default is @var{auto}.
 @end table
 
 The @option{x}, and @option{y} expressions can contain the following
@@ -19489,6 +19659,20 @@ By default value 0xf, all planes will be processed.
 Do not require 2nd input for processing, instead use alpha plane from input stream.
 @end table
 
+@section premultiply_dynamic
+Dynamically premultiply or unpremultiply the input video stream as needed,
+to match the requirements of the downstream filter graph. This is roughly
+equivalent to either @code{premultiply:inplace=yes} or
+@code{unpremultiply:inplace=yes}, or otherwise a noop.
+
+The filter accepts the following option:
+
+@table @option
+@item planes
+Set which planes will be processed, unprocessed planes will be copied.
+By default value 0xf, all planes will be processed.
+@end table
+
 @section prewitt
 Apply prewitt operator to input video stream.
 
@@ -19642,7 +19826,7 @@ Specifies which version of the stats file format to use. Details of
 each format are written below.
 Default value is 1.
 
-@item stats_add_max
+@item output_max
 Determines whether the max value is output to the stats log.
 Default value is 0.
 Requires stats_version >= 2. If this is set and stats_version < 2,
@@ -19817,7 +20001,7 @@ To enable the compilation of this filter, you need to configure FFmpeg with
 @code{--enable-libqrencode}.
 
 The QR code is generated from the provided text or text pattern. The
-corresponding QR code is scaled and overlayed into the video output according to
+corresponding QR code is scaled and overlaid into the video output according to
 the specified options.
 
 In case no text is specified, no QR code is overlaied.
@@ -21601,6 +21785,19 @@ Keep the same chroma location (default).
 @item bottomleft
 @item bottom
 @end table
+
+@item alpha_mode
+Set the alpha moda.
+Available values are:
+
+@table @samp
+@item auto
+Keep the same alpha mode (default).
+
+@item unspecified, unknown
+@item premultiplied
+@item straight
+@end table
 @end table
 
 @section shear
@@ -23146,7 +23343,7 @@ by progressively selecting a different column from each input frame.
 
 The end result is a sort of inverted parallax, so that far away objects move
 much faster that the ones in the front. The ideal conditions for this video
-effect are when there is either very little motion and the backgroud is static,
+effect are when there is either very little motion and the background is static,
 or when there is a lot of motion and a very wide depth of field (e.g. wide
 panorama, while moving on a train).
 
@@ -23174,7 +23371,7 @@ How many columns should be inserted before end of filtering.
 
 Normally the filter shifts and tilts from the very first frame, and stops when
 the last one is received. However, before filtering starts, normal video may
-be preseved, so that the effect is slowly shifted in its place. Similarly,
+be preserved, so that the effect is slowly shifted in its place. Similarly,
 the last video frame may be reconstructed at the end. Alternatively it is
 possible to just start and end with black.
 
@@ -25495,7 +25692,7 @@ pixel formats are not RGB.
 @item fitmode, fm
 Set sample aspect ratio of video output frames.
 Can be used to configure waveform so it is not
-streched too much in one of directions.
+stretched too much in one of directions.
 
 @table @samp
 @item none
@@ -28618,6 +28815,10 @@ Allocates linear images. Does not apply to decoding.
 
 @item disable_multiplane
 Disables multiplane images. Does not apply to decoding.
+
+@item avoid_host_import
+Avoids the use of dynamic host memory imports, in favor of a regular memcpy()
+into a previously mapped buffer.
 @end table
 
 @item -filter_hw_device @var{name}
@@ -29121,6 +29322,11 @@ A string representing the color range of the buffered video frames.
 It may be a number corresponding to a color range, or a color range
 name.
 
+@item alpha_mode
+A string representing the alpha mode of the buffered video frames.
+It may be a number corresponding to an alpha mode, or an alpha mode
+name.
+
 @item pixel_aspect, sar
 The sample (pixel) aspect ratio of the input video.
 
@@ -29418,6 +29624,165 @@ by specifying a smaller size and its offsets into the screen:
 @example
 ddagrab=video_size=800x600:offset_x=100:offset_y=100
 @end example
+
+
+@section gfxcapture
+
+Capture windows or monitors using Windows.Graphics.Capture API.
+
+This source provides low overhead capture of application windows or entire monitors.
+The filter outputs hardware frames in @code{d3d11} format; use @code{hwdownload,format=}
+if system memory frames are required.
+
+The window to be captured can be selected via regular expressions on its title,
+class name or backing executable name, by explicit native handles, or by monitor
+index or explicit native handle. A window must match all provided expressions to be
+selected. The first matching window will be picked, in whatever order Windows
+returns them.
+
+Explicit handles (@option{hwnd}, @option{hmonitor}) override pattern or index
+based selection. If neither handles nor a monitor index are given, the first
+window matching the provided regular expressions is captured.
+
+This source does NOT hold a stable FPS. It returns frames at whatever rate the compositor
+provides them, only capped by the @option{max_framerate}.
+If you need a stable rate, you need to add an fps filter to drop/duplicate frames as needed.
+
+If the capture source disappears mid-capture (window closed, monitor disconnected), the filter will return EOF.
+
+This source accepts the following options:
+@table @option
+@item window_title
+ECMAScript regular expression matched against the window title. Supports a
+PCRE style @code{(?i)} prefix for case-insensitive matching.
+
+@item window_class
+As @option{window_title}, but matched against the window class name.
+
+@item window_exe
+As @option{window_title}, but matched against the executable file name of the
+window's process.
+
+@item monitor_idx
+Zero-based index of the monitor to capture.
+
+Can also be set to @code{window} to capture the monitor the selected window
+is displayed on at filter initialization time.
+
+@item hwnd
+Explicit native window handle (HWND).
+
+@item hmonitor
+Explicit native monitor handle (HMONITOR).
+
+@item capture_cursor
+Capture the mouse cursor. Enabled by default.
+
+@item capture_border
+Capture the full area of the window, including its window decorarions/border.
+Disabled by default.
+
+@item display_border
+Draw a yellow highlight border around the captured window. Disabled by default.
+
+@item max_framerate
+Maximum capture frame rate. Accepts a video rate (e.g. @code{30}, @code{60/1},
+@code{24000/1001}). The default is @code{60} FPS.
+The actual rate is the rate at which the compositor renders the window/monitor,
+capped by this option.
+
+@item width
+Force the output canvas width. If zero (default) the initial captured source
+width is used. If a negative number is provided, the width will be rounded
+down to the next multiple of that number.
+
+See @option{resize_mode}.
+
+@item height
+Force the output canvas height. If zero (default) the initial captured source
+height is used. If a negative number is provided, the height will be rounded
+down to the next multiple of that number.
+
+See @option{resize_mode}.
+
+@item crop_left
+Crop this many pixels from the left side of the captured frames.
+
+@item crop_top
+Crop this many pixels from the left side of the captured frames.
+
+@item crop_right
+Crop this many pixels from the left side of the captured frames.
+
+@item crop_bottom
+Crop this many pixels from the left side of the captured frames.
+
+@item premultiplied
+If set to 1, return frames with premultiplied alpha. Default is 0 (straight
+alpha).
+
+@item resize_mode
+Defines how the captured content is fitted into the output canvas size.
+Possible values:
+@table @samp
+@item crop
+Crop (or pad with black) to the canvas size. (default)
+@item scale
+Scale the source to fill the canvas, potentially altering aspect ratio.
+@item scale_aspect
+Scale the source to fit inside the canvas while preserving aspect ratio.
+Remaining area is filled with black.
+@end table
+
+@item scale_mode
+Scaling algorithm used when resizing is required.
+
+Possible values:
+@table @samp
+@item point
+Nearest neighbour (pixelated) scaling.
+@item bilinear
+Bilinear filtering. (default)
+@item bicubic
+Bicubic filtering. Potentially more blurry, but fewer scaling artifacts depending on contents.
+@end table
+
+@item output_fmt
+Desired output pixel format inside the D3D11 hardware frames.
+
+Possible values:
+@table @samp
+@item bgra
+@item 8bit
+8 bit BGRA output (default)
+@item x2bgr10
+@item 10bit
+10 bit BGR output
+@item rgbaf16
+@item 16bit
+16bit float RGBA output
+@end table
+
+@end table
+
+@subsection Examples
+@itemize
+@item Capture a window by title (case-insensitive) at a maximum of 60 fps:
+@example
+ffmpeg -filter_complex gfxcapture=window_title='(?i)My Application':max_framerate=60,hwdownload,format=bgra,format=yuv420p -c:v libx264 -crf 15 capture.mp4
+@end example
+
+@item Capture monitor 1 at native refresh, 10bit color depth, scale to 1920x1080 preserving aspect:
+@example
+ffmpeg -filter_complex gfxcapture=monitor_idx=1:width=1920:height=1080:resize_mode=scale_aspect:output_fmt=10bit -c:v hevc_nvenc -cq 15 capture.mp4
+@end example
+
+@item Capture a window by executable name, draw border, force point scaling, fixed 60 fps:
+@example
+ffmpeg -filter_complex gfxcapture=window_exe='^firefox.exe$':display_border=1:scale_mode=point,fps=60 -rc qvbr -qvbr_quality_level 15 -c:v h264_amf capture.mp4
+@end example
+
+@end itemize
 
 
 @section gradients
@@ -30824,6 +31189,7 @@ bench=start,selectivecolor=reds=-.2 .12 -.49,bench=stop
 @end example
 @end itemize
 
+@anchor{concat filter}
 @section concat
 
 Concatenate audio and video streams, joining them together one after the
@@ -31770,9 +32136,9 @@ This filter accepts the following options:
 The expression which is evaluated for each frame to construct its timestamp.
 
 @item strip_fps (@emph{video only})
-Boolean option which determines if the original framerate metadata is unset.
-If set to true, be advised that a sane frame rate should be explicitly
-specified if output is sent to a constant frame rate muxer.
+Boolean option which determines if the original framerate and frame duration
+metadata is unset. If set to true, be advised that a sane frame rate should be
+explicitly specified if output is sent to a constant frame rate muxer.
 Default is @code{false}.
 
 @end table

@@ -141,6 +141,11 @@ typedef struct AVFilterFormatsConfig {
     AVFilterFormats *color_spaces;  ///< AVColorSpace
     AVFilterFormats *color_ranges;  ///< AVColorRange
 
+    /**
+     * List of supported alpha modes, only for video with an alpha channel.
+     */
+    AVFilterFormats *alpha_modes;  ///< AVAlphaMode
+
 } AVFilterFormatsConfig;
 
 /**
@@ -427,6 +432,8 @@ struct AVFilterLink {
 
     AVFrameSideData **side_data;
     int nb_side_data;
+
+    enum AVAlphaMode alpha_mode; ///< alpha mode (for videos with an alpha channel)
 
     /*****************************************************************
      * All fields below this line are not part of the public API. They
@@ -898,7 +905,7 @@ typedef struct AVFilterParams {
     char                *instance_name;
 
     /**
-     * Options to be apllied to the filter.
+     * Options to be applied to the filter.
      *
      * Filled by avfilter_graph_segment_parse(). Afterwards may be freely
      * modified by the caller.
@@ -1081,7 +1088,7 @@ int avfilter_graph_segment_init(AVFilterGraphSegment *seg, int flags);
  * Unlabeled outputs are
  * - linked to the first unlinked unlabeled input in the next non-disabled
  *   filter in the chain, if one exists
- * - exported in the ouputs linked list otherwise, with NULL label
+ * - exported in the outputs linked list otherwise, with NULL label
  *
  * Similarly, unlinked input pads are exported in the inputs linked list.
  *
