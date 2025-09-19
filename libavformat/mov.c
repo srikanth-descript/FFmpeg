@@ -771,7 +771,6 @@ static int mov_read_dref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         } else if (dref->type == 0x206c7275) {
             /* URL reference */
             int ret;
-            uint32_t flags = avio_rb32(pb); // version + flags
             if (size > 8) {
                 int url_len = (int)(size - 8);
                 av_free(dref->url);
