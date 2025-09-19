@@ -656,6 +656,7 @@ static int mov_read_dref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         MOVDref *dref = &sc->drefs[i];
         av_freep(&dref->path);
         av_freep(&dref->dir);
+        av_freep(&dref->url);
     }
     av_free(sc->drefs);
     sc->drefs_count = 0;
@@ -766,6 +767,25 @@ static int mov_read_dref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
                     av_log(c->fc, AV_LOG_DEBUG, "dir %s\n", dref->dir);
                 } else
                     avio_skip(pb, len);
+            }
+        } else if (dref->type == 0x206c7275) {
+            /* URL reference */
+            int ret;
+            uint32_t flags = avio_rb32(pb); // version + flags
+            if (size > 8) {
+                int url_len = (int)(size - 8);
+                av_free(dref->url);
+                dref->url = av_malloc(url_len + 1);
+                if (!dref->url)
+                    return AVERROR(ENOMEM);
+
+                ret = ffio_read_size(pb, (unsigned char*)dref->url, url_len);
+                if (ret < 0) {
+                    av_freep(&dref->url);
+                    return ret;
+                }
+                dref->url[url_len] = 0;
+                av_log(c->fc, AV_LOG_DEBUG, "URL reference: %s\n", dref->url);
             }
         } else {
             av_log(c->fc, AV_LOG_DEBUG, "Unknown dref type 0x%08"PRIx32" size %"PRIu32"\n",
@@ -5042,6 +5062,40 @@ static int mov_open_dref(MOVContext *c, AVIOContext **pb, const char *src, MOVDr
                 return AVERROR(ENOENT);
             if (!c->fc->io_open(c->fc, pb, filename, AVIO_FLAG_READ, NULL))
                 return 0;
+        }
+    } else if (ref->url) {
+        /* URL reference - check if it's a file URL or relative path */
+        const char *url = ref->url;
+
+        /* Skip file:// prefix if present */
+        if (av_strstart(url, "file://", &url)) {
+            /* File URL - treat as absolute path only if use_absolute_path is enabled */
+            if (c->use_absolute_path) {
+                av_log(c->fc, AV_LOG_WARNING, "Using absolute file URL on user request, "
+                       "this is a possible security issue\n");
+                if (!c->fc->io_open(c->fc, pb, url, AVIO_FLAG_READ, NULL))
+                    return 0;
+            } else {
+                av_log(c->fc, AV_LOG_WARNING, "File URL '%s' blocked for security, "
+                       "set use_absolute_path to allow\n", ref->url);
+                return AVERROR(ENOENT);
+            }
+        } else if (url[0] != '/' && url[0] != '\\') {
+            /* Relative path URL - construct relative to source file */
+            char filename[1025];
+            const char *src_path = strrchr(src, '/');
+
+            if (src_path && (src_path - src + 1 + strlen(url)) < sizeof(filename)) {
+                memcpy(filename, src, src_path - src + 1);
+                filename[src_path - src + 1] = 0;
+                av_strlcat(filename, url, sizeof(filename));
+
+                if (!c->fc->io_open(c->fc, pb, filename, AVIO_FLAG_READ, NULL))
+                    return 0;
+            }
+        } else {
+            av_log(c->fc, AV_LOG_WARNING, "Absolute URL path '%s' not supported for security\n", url);
+            return AVERROR(ENOENT);
         }
     } else if (c->use_absolute_path) {
         av_log(c->fc, AV_LOG_WARNING, "Using absolute path on user request, "
@@ -9887,6 +9941,7 @@ static void mov_free_stream_context(AVFormatContext *s, AVStream *st)
     for (int i = 0; i < sc->drefs_count; i++) {
         av_freep(&sc->drefs[i].path);
         av_freep(&sc->drefs[i].dir);
+        av_freep(&sc->drefs[i].url);
     }
     av_freep(&sc->drefs);
 

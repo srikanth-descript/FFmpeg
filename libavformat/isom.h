@@ -86,6 +86,7 @@ typedef struct MOVDref {
     uint32_t type;
     char *path;
     char *dir;
+    char *url;           /* URL string for 'url ' type references */
     char volume[28];
     char filename[64];
     int16_t nlvl_to, nlvl_from;
