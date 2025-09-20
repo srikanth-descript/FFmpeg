@@ -772,7 +772,7 @@ static int mov_read_dref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         } else if (dref->type == MKTAG('u','r','l',' ')) {
             /* URL reference */
             int ret;
-            if (size > 8) {
+            if (size > 13) {
                 char *buffer = av_malloc(size - 8 + 1);
                 if (!buffer)
                     return AVERROR(ENOMEM);
@@ -796,7 +796,7 @@ static int mov_read_dref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         } else if (dref->type == MKTAG('u','r','n',' ')) {
             /* URN reference */
             int ret;
-            if (size > 8) {
+            if (size > 13) {
                 char *buffer = av_malloc(size - 8 + 1);
                 if (!buffer)
                     return AVERROR(ENOMEM);
