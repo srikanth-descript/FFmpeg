@@ -5111,8 +5111,12 @@ static int mov_open_dref(MOVContext *c, AVIOContext **pb, const char *src, MOVDr
                 return 0;
         }
     } else if (ref->location) {
-        /* URL/URN reference - check if it's a file URL or relative path */
+        /* URL/URN reference - check if it's a file URL, network URL, or relative path */
         const char *location = ref->location;
+        char proto[64];
+
+        /* Parse the URL to extract protocol scheme */
+        av_url_split(proto, sizeof(proto), NULL, 0, NULL, 0, NULL, NULL, 0, location);
 
         /* Skip file:// prefix if present */
         if (av_strstart(location, "file://", &location)) {
@@ -5127,6 +5131,11 @@ static int mov_open_dref(MOVContext *c, AVIOContext **pb, const char *src, MOVDr
                        "set use_absolute_path to allow\n", ref->location);
                 return AVERROR(ENOENT);
             }
+        } else if (proto[0] && strcmp(proto, "file") != 0) {
+            /* Network URL (http, https, ftp, etc.) - use FFmpeg's URL handling */
+            av_log(c->fc, AV_LOG_DEBUG, "Opening network URL: %s\n", location);
+            if (!c->fc->io_open(c->fc, pb, location, AVIO_FLAG_READ, NULL))
+                return 0;
         } else if (location[0] != '/' && location[0] != '\\') {
             /* Relative path URL - construct relative to source file */
             char filename[1025];
